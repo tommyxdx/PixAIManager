@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "Gallery Manager for PixAI (Unofficial)",
+    "description": "Extension name in the Chrome Web Store and chrome://extensions"
+  },
+  "appDesc": {
+    "message": "Batch-manage your own PixAI generations on pixai.art: local folders, ZIP downloads with readable file names, stars and bulk delete.",
+    "description": "Store summary, at most 132 characters"
+  },
+  "actionTitle": {
+    "message": "Open Gallery Manager for PixAI",
+    "description": "Toolbar button tooltip"
+  }
+}

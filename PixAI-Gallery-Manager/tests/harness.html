@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PGM harness</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 20px 24px 80px; background: #18181b; color: #e4e4e7; font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 22px 0 8px; display: flex; gap: 12px; align-items: center; }
+  .muted { color: #a1a1aa; }
+  code { background: #27272a; padding: 1px 6px; border-radius: 4px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button:hover { border-color: #a855f7; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #27272a; vertical-align: top; word-break: break-all; }
+  th { color: #a1a1aa; font-weight: 600; }
+  td.ok { color: #4ade80; }
+  td.bad { color: #f87171; }
+  pre { background: #0f0f12; border: 1px solid #27272a; border-radius: 6px; padding: 10px; max-height: 320px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+  .warn { color: #fbbf24; }
+</style>
+</head>
+<body>
+<h1>PixAI 图库管理：本地测试页</h1>
+<div class="muted">
+  API <code id="api"></code> · token <span id="tokenState"></span> ·
+  用法：<code>python tests/mock_server.py 18765</code>，再在扩展根目录运行 <code>python -m http.server 8000</code>，
+  打开 <code>http://127.0.0.1:8000/tests/harness.html</code>。参数：<code>?loggedOut=1</code>、<code>?noopen=1</code>、<code>?api=http://127.0.0.1:端口</code>。
+</div>
+
+<div class="buttons">
+  <button id="toggle">打开 / 关闭界面（PGM.ui.toggle）</button>
+  <button id="actionClick">模拟点击扩展图标（pgm-toggle 消息）</button>
+  <button id="logout">清除 token（模拟未登录）</button>
+  <button id="login">写入 token</button>
+  <button id="fail">接下来 2 个 API 请求返回 503</button>
+  <button id="reset">重置 mock 数据</button>
+  <button id="clearStorage">清空扩展存储（收藏夹和设置）</button>
+  <label><input type="checkbox" id="failDownloads"> 模拟下载失败（每第 5 个）</label>
+</div>
+
+<h2>记录到的下载 <span class="muted">(<span id="dlCount">0</span>)</span> <button id="clearDl">清空</button></h2>
+<table>
+  <thead><tr><th>#</th><th>任务</th><th>filename</th><th>url</th><th>结果</th></tr></thead>
+  <tbody id="downloads"></tbody>
+</table>
+
+<h2>mock 请求日志 <button id="showLog">刷新</button></h2>
+<pre id="log">（点“刷新”读取 /__mock/log）</pre>
+
+<h2>脚本加载</h2>
+<pre id="boot"></pre>
+
+<script>
+(function () {
+  "use strict";
+  const params = new URLSearchParams(location.search);
+  const API = (params.get("api") || "http://127.0.0.1:18765").replace(/\/+$/, "");
+  const TOKEN_KEY = "https://api.pixai.art:token";
+  const TOKEN = "test.token.value";
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const bootLog = (line) => ($("boot").textContent += line + "\n");
+
+  globalThis.PGM_TEST_API_BASE = API;
+  if (params.get("loggedOut") === "1") localStorage.removeItem(TOKEN_KEY);
+  else localStorage.setItem(TOKEN_KEY, TOKEN);
+
+  window.addEventListener("error", (e) => bootLog("ERROR " + e.message + " @ " + (e.filename || "") + ":" + (e.lineno || "")));
+  window.addEventListener("unhandledrejection", (e) => bootLog("UNHANDLED " + ((e.reason && e.reason.stack) || e.reason)));
+
+  // ---- chrome.* stubs -------------------------------------------------------
+
+  function makeEvent() {
+    const fns = [];
+    return {
+      addListener: (fn) => fns.push(fn),
+      removeListener: (fn) => {
+        const i = fns.indexOf(fn);
+        if (i >= 0) fns.splice(i, 1);
+      },
+      hasListener: (fn) => fns.includes(fn),
+      emit: (...args) => fns.slice().forEach((fn) => fn(...args))
+    };
+  }
+
+  const storageData = new Map();
+  const storageChanged = makeEvent();
+  const clone = (v) => (v === undefined ? undefined : structuredClone(v));
+  function keyList(keys) {
+    if (keys == null) return [...storageData.keys()];
+    if (typeof keys === "string") return [keys];
+    return Array.isArray(keys) ? keys : Object.keys(keys);
+  }
+  function emitChanges(changes) {
+    if (Object.keys(changes).length) setTimeout(() => storageChanged.emit(changes, "local"), 0);
+  }
+
+  const runtimeMessage = makeEvent();
+  const shown = [];
+
+  globalThis.chrome = {
+    runtime: {
+      id: "pgm-harness",
+      lastError: undefined,
+      getURL: (p) => new URL("../" + p, location.href).href,
+      connect: (info) => connectFake((info && info.name) || ""),
+      sendMessage: async (msg) => {
+        if (msg && msg.type === "pgm-show") shown.push(msg.id);
+        return { ok: true };
+      },
+      onMessage: runtimeMessage
+    },
+    storage: {
+      local: {
+        async get(keys) {
+          const out = {};
+          for (const k of keyList(keys)) {
+            if (storageData.has(k)) out[k] = clone(storageData.get(k));
+            else if (keys && typeof keys === "object" && !Array.isArray(keys)) out[k] = keys[k];
+          }
+          return out;
+        },
+        async set(obj) {
+          const changes = {};
+          for (const [k, v] of Object.entries(obj)) {
+            changes[k] = { oldValue: clone(storageData.get(k)), newValue: clone(v) };
+            storageData.set(k, clone(v));
+          }
+          emitChanges(changes);
+        },
+        async remove(keys) {
+          const changes = {};
+          for (const k of keyList(keys)) {
+            if (storageData.has(k)) changes[k] = { oldValue: clone(storageData.get(k)) };
+            storageData.delete(k);
+          }
+          emitChanges(changes);
+        },
+        async clear() {
+          return this.remove(null);
+        }
+      },
+      onChanged: storageChanged
+    }
+  };
+
+  // An in-page port pair; messages are structured-cloned and delivered asynchronously, like Chrome.
+  function connectFake(name) {
+    let connected = true;
+    const content = { name, onMessage: makeEvent(), onDisconnect: makeEvent() };
+    const background = { name, onMessage: makeEvent(), onDisconnect: makeEvent() };
+    const deliver = (target, msg) => {
+      if (!connected) throw new Error("Attempting to use a disconnected port object");
+      const copy = structuredClone(msg);
+      setTimeout(() => connected && target.onMessage.emit(copy, target), 0);
+    };
+    const closer = (other) => () => {
+      if (!connected) return;
+      connected = false;
+      setTimeout(() => other.onDisconnect.emit(other), 0);
+    };
+    content.postMessage = (m) => deliver(background, m);
+    background.postMessage = (m) => deliver(content, m);
+    content.disconnect = closer(background);
+    background.disconnect = closer(content);
+    fakeBackground(background);
+    return content;
+  }
+
+  // ---- fake background: same protocol as background.js, fake downloader ------
+
+  const recorded = [];
+  globalThis.PGM_HARNESS = { downloads: recorded, shown, api: API };
+
+  function fakeBackground(port) {
+    if (port.name !== "pgm-download") return;
+    const job = { cancelled: false };
+    let queue = null;
+    let open = true;
+    const post = (msg) => {
+      if (!open) return;
+      try {
+        port.postMessage(msg);
+      } catch (e) {
+        open = false;
+      }
+    };
+    const cancel = () => {
+      job.cancelled = true;
+      if (queue) queue.cancel();
+      if (job.abort) job.abort();
+    };
+    port.onDisconnect.addListener(() => {
+      open = false;
+      cancel();
+    });
+    port.onMessage.addListener((msg) => {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "cancel") cancel();
+      if (msg.type !== "start" || queue || job.zip) return;
+      if (msg.zip) {
+        job.zip = true;
+        fakeZip(msg, post, job);
+        return;
+      }
+      const label = String(msg.label || "");
+      const entries = (Array.isArray(msg.entries) ? msg.entries : []).map((e, i) => ({
+        url: typeof e.url === "string" ? e.url : "",
+        path: typeof e.path === "string" ? e.path : "",
+        index: Number.isInteger(e.index) ? e.index : i,
+        toPng: !!e.toPng
+      }));
+      const concurrency = Math.min(3, Math.max(1, Math.floor(msg.concurrency) || 3));
+      queue = PGM.queue.createQueue({
+        concurrency,
+        run: (entry) => fakeDownload(entry, label),
+        onProgress: (p) => post({ type: "progress", done: p.done, failed: p.failed, total: p.total,
+          current: p.current.path, index: p.current.index, error: p.error || undefined })
+      });
+      queue.start(entries).then((r) => post({
+        type: "finished", done: r.done, total: r.total, cancelled: r.cancelled,
+        failed: r.failed.map((f) => ({ path: f.entry.path, error: f.error }))
+      }));
+    });
+  }
+
+  // ZIP jobs: the real packer (src/packer.js) runs here instead of in offscreen.html. Images come from
+  // the mock; each archive is uploaded to /__mock/upload so Python can open it, and linked in the table.
+  // ?zipPartKB=N makes small parts to test splitting.
+  let zipFetches = 0;
+  function fakeZip(msg, post, job) {
+    const z = msg.zip || {};
+    const label = String(msg.label || "");
+    const all = (Array.isArray(msg.entries) ? msg.entries : []).map((e, i) => ({
+      url: typeof e.url === "string" ? e.url : "",
+      name: typeof e.name === "string" ? e.name : "",
+      time: Number(e.time) || 0,
+      index: Number.isInteger(e.index) ? e.index : i,
+      toPng: !!e.toPng
+    }));
+    const entries = [];
+    const preFailed = [];
+    for (const e of all) {
+      if (PGM.util.isAllowedUrl(e.url)) entries.push(e);
+      else preFailed.push(Object.assign({}, e, { error: "BAD_URL" }));
+    }
+    const saved = new Set();
+    const ctrl = new AbortController();
+    job.abort = () => ctrl.abort();
+    const partKB = Number(params.get("zipPartKB"));
+    const fail = (code) => Object.assign(new Error(code), { code });
+    PGM.packer.run({
+      label, lang: z.lang, baseName: z.baseName, concurrency: msg.concurrency, entries, preFailed,
+      partBytes: partKB > 0 ? partKB * 1024 : (Number(z.partMB) || 1000) * 1024 * 1024
+    }, {
+      signal: ctrl.signal,
+      sleep: () => sleep(30),
+      fetchFile: async (url, signal) => {
+        const n = ++zipFetches;
+        if ($("failDownloads").checked && n % 5 === 0) throw fail("HTTP_404");
+        await sleep(40 + Math.random() * 80);
+        const res = await fetch(url, { signal, credentials: "omit" });
+        if (!res.ok) throw fail("HTTP_" + res.status);
+        return new Uint8Array(await res.arrayBuffer());
+      },
+      save: async (blob, name) => {
+        const row = { n: recorded.length + 1, label, url: "zip " + blob.size + " bytes", filename: (z.dir ? z.dir + "/" : "") + name, result: "…", blob: URL.createObjectURL(blob) };
+        recorded.push(row);
+        renderDownloads();
+        try {
+          const res = await fetch(API + "/__mock/upload?name=" + encodeURIComponent(name), { method: "POST", body: blob });
+          row.result = res.ok ? "complete" : "HTTP_" + res.status;
+        } catch (e) {
+          row.result = "upload failed";
+        }
+        renderDownloads();
+        if (row.result !== "complete") throw fail("ZIP_SAVE_FAILED");
+        return row.n;
+      },
+      transform: (bytes, entry) => PGM.convert.maybePng(bytes, entry.name),
+      onEvent: (ev) => {
+        if (ev.type === "part" && ev.ok) for (const i of ev.indices) saved.add(i);
+        post(ev);
+      }
+    }).then((r) => post({
+      type: "finished", done: saved.size, total: all.length, cancelled: r.cancelled, zips: r.zips,
+      failed: r.failed.map((f) => ({ path: f.name, index: f.index, error: f.error }))
+    }));
+  }
+
+  async function fakeDownload(entry, label) {
+    const row = { n: recorded.length + 1, label, url: entry.url, filename: entry.path, result: "…" };
+    recorded.push(row);
+    renderDownloads();
+    const finish = (result) => {
+      row.result = result;
+      renderDownloads();
+      if (result !== "complete") throw new Error(result);
+    };
+    const problem = PGM.queue.checkEntry(entry);
+    if (problem) return finish(problem);
+    await sleep(60 + Math.random() * 160);
+    if ($("failDownloads").checked && row.n % 5 === 0) return finish("NETWORK_FAILED");
+    let result;
+    try {
+      if (entry.toPng) {
+        // like background.js: the offscreen document turns a still WebP into PNG before saving
+        const res = await fetch(entry.url, { credentials: "omit" });
+        if (!res.ok) return finish("HTTP_" + res.status);
+        const r = await PGM.convert.maybePng(new Uint8Array(await res.arrayBuffer()), row.filename);
+        row.filename = r.name;
+        row.url += r.converted ? " → PNG " + r.bytes.length + " bytes" : "";
+        return finish("complete");
+      }
+      const res = await fetch(entry.url, { method: "HEAD", credentials: "omit" });
+      result = res.ok ? "complete" : "HTTP_" + res.status;
+    } catch (e) {
+      result = "NETWORK_FAILED";
+    }
+    return finish(result);
+  }
+
+  function renderDownloads() {
+    const body = $("downloads");
+    body.textContent = "";
+    for (const r of recorded) {
+      const tr = document.createElement("tr");
+      for (const [value, cls] of [[r.n], [r.label], [r.filename], [r.url], [r.result, r.result === "complete" ? "ok" : r.result === "…" ? "" : "bad"]]) {
+        const td = document.createElement("td");
+        td.textContent = String(value);
+        if (cls) td.className = cls;
+        tr.appendChild(td);
+      }
+      if (r.blob) {
+        const a = document.createElement("a");
+        a.href = r.blob;
+        a.download = r.filename.split("/").pop();
+        a.textContent = " ⬇";
+        tr.children[2].appendChild(a);
+      }
+      body.appendChild(tr);
+    }
+    $("dlCount").textContent = String(recorded.length);
+  }
+
+  // ---- panel ------------------------------------------------------------------
+
+  function renderToken() {
+    $("tokenState").textContent = localStorage.getItem(TOKEN_KEY) ? "已写入（已登录）" : "无（未登录）";
+  }
+
+  const ALLOWED = [
+    ["GET", /^\/v2\/user\/me$/], ["GET", /^\/v2\/task\/search$/], ["GET", /^\/v2\/task\/\d+$/],
+    ["GET", /^\/v2\/media\/batch$/], ["PUT", /^\/v2\/task\/bookmarks\/batch$/],
+    ["POST", /^\/v2\/task\/media\/batch-delete$/], ["POST", /^\/v2\/task\/\d+\/delete$/],
+    ["GET", /^\/v2\/collection\/list\/\d+$/], ["GET", /^\/v2\/collection\/[0-9a-f-]+\/items$/],
+    ["GET", /^\/v2\/artwork\/\d+\/task-parameters$/]
+  ];
+
+  async function showLog() {
+    try {
+      const res = await fetch(API + "/__mock/log");
+      const data = await res.json();
+      const rows = data.requests.filter((r) => r.path.startsWith("/v2/"));
+      const lines = rows.map((r) => {
+        const allowed = r.method === "OPTIONS" || ALLOWED.some(([m, re]) => m === r.method && re.test(r.path));
+        const body = r.body ? " " + JSON.stringify(r.body).slice(0, 160) : "";
+        return (allowed ? "" : "!! NOT ALLOWED ") + r.method + " " + r.path + (r.query ? "?" + r.query : "") +
+          (r.auth ? "  [auth]" : "") + body;
+      });
+      const bad = lines.filter((l) => l.startsWith("!!")).length;
+      $("log").textContent = "共 " + rows.length + " 个 /v2 请求，" + (bad ? bad + " 个不在允许列表！" : "全部在允许列表内。") +
+        "\n\n" + lines.slice(-200).join("\n");
+    } catch (e) {
+      $("log").textContent = "读取失败：" + e.message + "（mock 服务器在运行吗？）";
+    }
+  }
+
+  async function mockPost(path, body) {
+    try {
+      await fetch(API + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    } catch (e) {
+      bootLog("mock POST " + path + " failed: " + e.message);
+    }
+  }
+
+  $("api").textContent = API;
+  renderToken();
+  $("toggle").onclick = () => globalThis.PGM && PGM.ui && PGM.ui.toggle && PGM.ui.toggle();
+  $("actionClick").onclick = () => runtimeMessage.emit({ type: "pgm-toggle" }, { id: "pgm-harness" }, () => {});
+  $("logout").onclick = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    renderToken();
+  };
+  $("login").onclick = () => {
+    localStorage.setItem(TOKEN_KEY, TOKEN);
+    renderToken();
+  };
+  $("fail").onclick = () => mockPost("/__mock/fail", { count: 2, status: 503 });
+  $("reset").onclick = () => mockPost("/__mock/reset").then(showLog);
+  $("clearStorage").onclick = () => chrome.storage.local.clear();
+  $("clearDl").onclick = () => {
+    recorded.length = 0;
+    renderDownloads();
+  };
+  $("showLog").onclick = showLog;
+
+  // ---- load the content scripts in manifest order ------------------------------
+
+  function load(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "../" + src + "?v=" + Date.now(); // always the current file while developing
+      s.onload = () => {
+        bootLog("loaded " + src);
+        resolve();
+      };
+      s.onerror = () => reject(new Error("could not load " + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function boot() {
+    const manifest = await (await fetch("../manifest.json", { cache: "no-store" })).json();
+    const files = manifest.content_scripts[0].js;
+    if (params.get("noopen") !== "1") history.replaceState(null, "", location.pathname + location.search + "#pgm");
+    await load("src/ns.js");
+    await load("src/queue.js"); // used by the fake background above
+    await load("src/zip.js"); // the fake background packs ZIP jobs in this page
+    await load("src/packer.js");
+    await load("src/convert.js");
+    for (const f of files) if (f !== "src/ns.js") await load(f);
+    const ui = globalThis.PGM && PGM.ui;
+    if (!ui) {
+      bootLog("PGM.ui is missing");
+      return;
+    }
+    if (params.get("noopen") !== "1" && typeof ui.isOpen === "function" && !ui.isOpen()) {
+      if (typeof ui.open === "function") ui.open();
+      else if (typeof ui.toggle === "function") ui.toggle();
+    }
+    bootLog("ready");
+  }
+
+  boot().catch((e) => bootLog("BOOT FAILED " + e.message));
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "PixAI 图库管理（非官方）",
+    "description": "扩展名称"
+  },
+  "appDesc": {
+    "message": "在 pixai.art 里批量管理你自己的生成图片：本机收藏夹、按规则命名并打包成 ZIP 下载、星标和批量删除。非官方扩展。",
+    "description": "商店简介，最多 132 个字符"
+  },
+  "actionTitle": {
+    "message": "打开 PixAI 图库管理",
+    "description": "工具栏按钮提示"
+  }
+}

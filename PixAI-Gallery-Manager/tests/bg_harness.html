@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PGM background + offscreen test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; background: #111; color: #ddd; }
+  #result { font-size: 20px; font-weight: 700; margin-bottom: 12px; }
+  .pass { color: #4ade80; }
+  .fail { color: #f87171; }
+  .err { color: #fca5a5; white-space: pre-wrap; margin-left: 1em; }
+  pre { font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="result">running…</div>
+<ul id="list"></ul>
+<pre id="log"></pre>
+<!--
+  Runs the real background.js against stubbed chrome.* APIs, and the real offscreen scripts (the
+  list is read from offscreen.html) in a same-origin iframe that stands in for the offscreen document.
+  Images come from the mock server; chrome.downloads "saves" an archive by uploading it to
+  /__mock/upload, so tests/… Python checks can open it.
+
+  python tests/mock_server.py 18765, then serve the extension root and open tests/bg_harness.html
+-->
+<script>
+(function () {
+  "use strict";
+  const params = new URLSearchParams(location.search);
+  const API = (params.get("api") || "http://127.0.0.1:18765").replace(/\/+$/, "");
+  globalThis.PGM_TEST_API_BASE = API;
+  const log = (line) => (document.getElementById("log").textContent += line + "\n");
+  window.addEventListener("error", (e) => log("ERROR " + e.message + " @ " + e.filename + ":" + e.lineno));
+  window.addEventListener("unhandledrejection", (e) => log("UNHANDLED " + ((e.reason && e.reason.stack) || e.reason)));
+
+  function makeEvent() {
+    const fns = [];
+    return {
+      addListener: (fn) => fns.push(fn),
+      removeListener: (fn) => fns.splice(fns.indexOf(fn) >>> 0, 1),
+      hasListener: (fn) => fns.includes(fn),
+      emit: (...args) => fns.slice().forEach((fn) => fn(...args))
+    };
+  }
+
+  // A port pair with Chrome's behaviour: async structured-clone delivery, throws once disconnected.
+  function portPair(name, sender) {
+    let connected = true;
+    const a = { name, onMessage: makeEvent(), onDisconnect: makeEvent() };
+    const b = { name, sender, onMessage: makeEvent(), onDisconnect: makeEvent() };
+    const deliver = (target, msg) => {
+      if (!connected) throw new Error("Attempting to use a disconnected port object");
+      const copy = structuredClone(msg);
+      setTimeout(() => connected && target.onMessage.emit(copy, target), 0);
+    };
+    const closer = (other) => () => {
+      if (!connected) return;
+      connected = false;
+      setTimeout(() => other.onDisconnect.emit(other), 0);
+    };
+    a.postMessage = (m) => deliver(b, m);
+    b.postMessage = (m) => deliver(a, m);
+    a.disconnect = closer(b);
+    b.disconnect = closer(a);
+    return { client: a, server: b, kill: () => a.disconnect() };
+  }
+
+  const BASE = location.origin + "/";
+  const onConnect = makeEvent();
+  const downloadsChanged = makeEvent();
+  const H = (globalThis.BG = {
+    downloads: [], // {id, filename, url, size, state}
+    shown: [],
+    offscreenCreated: 0,
+    frame: null,
+    framePort: null,
+    inflight: 0,
+    maxInflight: 0,
+    saveDelay: 0,
+    failNextSave: null,
+    failFetches: {} // url -> number of offscreen fetches of it that fail like a network error
+  });
+
+  function makeOffscreenChrome(win) {
+    return {
+      runtime: {
+        id: "pgm-bg",
+        getURL: (p) => BASE + p,
+        connect(info) {
+          const pair = portPair(info.name, { id: "pgm-bg", url: BASE + "offscreen.html" });
+          H.framePort = pair;
+          onConnect.emit(pair.server);
+          return pair.client;
+        }
+      }
+    };
+  }
+  globalThis.makeOffscreenChrome = makeOffscreenChrome;
+
+  async function createFrame() {
+    const html = await (await fetch("../offscreen.html", { cache: "no-store" })).text();
+    const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1]);
+    const frame = document.createElement("iframe");
+    frame.style.display = "none";
+    // The inline script plays the extension environment; then the same scripts as offscreen.html.
+    frame.srcdoc = "<!doctype html><meta charset='utf-8'><script>" +
+      "window.chrome = parent.makeOffscreenChrome(window); window.PGM_TEST_API_BASE = parent.PGM_TEST_API_BASE;" +
+      "const f = window.fetch.bind(window); window.fetch = async (...a) => { const B = parent.BG; " +
+      "if (B.failFetches[String(a[0])] > 0) { B.failFetches[String(a[0])]--; throw new TypeError('Failed to fetch'); } B.inflight++; B.maxInflight = Math.max(B.maxInflight, B.inflight); try { return await f(...a); } finally { B.inflight--; } };" +
+      "<\/script>" + scripts.map((s) => `<script src="../${s}?v=${Date.now()}"><\/script>`).join("");
+    document.body.append(frame);
+    H.frame = frame;
+  }
+
+  let nextId = 1;
+  globalThis.chrome = {
+    runtime: {
+      id: "pgm-bg",
+      getURL: (p) => BASE + p,
+      onConnect,
+      onMessage: makeEvent(),
+      getPlatformInfo: async () => ({ os: "win" }),
+      lastError: undefined
+    },
+    offscreen: {
+      async createDocument(opts) {
+        if (H.frame) throw new Error("Only a single offscreen document may be created.");
+        if (opts.url !== "offscreen.html" || !opts.reasons.includes("BLOBS")) throw new Error("bad createDocument " + JSON.stringify(opts));
+        H.offscreenCreated++;
+        await createFrame();
+      },
+      async closeDocument() {
+        if (!H.frame) throw new Error("No current offscreen document.");
+        H.frame.remove();
+        H.frame = null;
+        if (H.framePort) H.framePort.kill();
+      }
+    },
+    downloads: {
+      onChanged: downloadsChanged,
+      async download(opts) {
+        const id = nextId++;
+        const row = { id, filename: opts.filename, url: opts.url, state: "in_progress", conflictAction: opts.conflictAction, saveAs: opts.saveAs };
+        H.downloads.push(row);
+        (async () => {
+          try {
+            if (H.saveDelay) await new Promise((r) => setTimeout(r, H.saveDelay));
+            if (H.failNextSave) {
+              const error = H.failNextSave;
+              H.failNextSave = null;
+              throw Object.assign(new Error(error), { reason: error });
+            }
+            const blob = await (await fetch(opts.url)).blob();
+            row.size = blob.size;
+            row.magic = [...new Uint8Array(await blob.slice(0, 4).arrayBuffer())];
+            const name = opts.filename.split("/").pop();
+            const res = await fetch(API + "/__mock/upload?name=" + encodeURIComponent(name), { method: "POST", body: blob });
+            if (!res.ok) throw new Error("upload " + res.status);
+            row.state = "complete";
+            downloadsChanged.emit({ id, state: { current: "complete" } });
+          } catch (e) {
+            row.state = "interrupted";
+            row.error = e.reason || "FILE_FAILED";
+            downloadsChanged.emit({ id, state: { current: "interrupted" }, error: { current: row.error } });
+          }
+        })();
+        return id;
+      },
+      async search(q) {
+        const row = H.downloads.find((d) => d.id === q.id);
+        return row && row.state !== "in_progress" ? [{ id: row.id, state: row.state, error: row.error, paused: false }] : [];
+      },
+      show: (id) => H.shown.push(id),
+      showDefaultFolder: () => H.shown.push("default")
+    },
+    action: { onClicked: makeEvent() },
+    tabs: { sendMessage: async () => ({}), create: async () => ({}) }
+  };
+  globalThis.importScripts = () => {}; // background.js's dependencies are loaded as script tags below
+
+  // A content-script port to the background, collecting every message.
+  globalThis.contentJob = function (start) {
+    const pair = portPair("pgm-download", { id: "pgm-bg", tab: { id: 1 }, url: "https://pixai.art/library" });
+    onConnect.emit(pair.server);
+    const port = pair.client;
+    const messages = [];
+    const done = new Promise((resolve) => {
+      port.onMessage.addListener((m) => {
+        messages.push(m);
+        if (m.type === "finished") resolve(m);
+      });
+      port.onDisconnect.addListener(() => resolve(null));
+    });
+    port.postMessage(Object.assign({ type: "start" }, start));
+    return { port, messages, done, kill: pair.kill };
+  };
+})();
+</script>
+<script>
+  document.write(["src/ns.js", "src/queue.js", "background.js"].map((s) => `<script src="../${s}?v=${Date.now()}"><\/script>`).join(""));
+</script>
+<script>
+(function () {
+  "use strict";
+  const API = globalThis.PGM_TEST_API_BASE;
+  const BG = globalThis.BG;
+  const tests = [];
+  const test = (name, fn) => tests.push({ name, fn });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  function eq(a, b, msg) {
+    const x = JSON.stringify(a), y = JSON.stringify(b);
+    if (x !== y) throw new Error((msg ? msg + ": " : "") + "expected " + y + ", got " + x);
+  }
+  function ok(v, msg) {
+    if (!v) throw new Error(msg || "expected truthy");
+  }
+  const img = (id, ext) => `${API}/img/${id}.${ext || "png"}`;
+  const zipStart = (entries, zip, extra) => Object.assign({
+    label: "下载：测试", concurrency: 3, entries,
+    zip: Object.assign({ baseName: "PixAI_测试_20261103-140509", dir: "PixAI/测试", lang: "zh", partMB: 1000 }, zip)
+  }, extra);
+  const entries = (ids) => ids.map((id, index) => ({ url: img(id), name: `风景_${index + 1}.png`, time: Date.parse("2026-11-03T06:05:09Z"), index }));
+  const IDS = ["2000000000000000001", "2000000000000000002", "2000000000000000003", "2000000000000000004", "2000000000000000005", "2000000000000000006", "2000000000000000007", "2000000000000000008"];
+
+  test("zip job: offscreen document, slots, save into the sub-folder, finished message", async () => {
+    BG.maxInflight = 0;
+    const job = contentJob(zipStart(entries(IDS)));
+    const fin = await job.done;
+    eq(BG.offscreenCreated, 1, "one offscreen document");
+    eq([fin.done, fin.total, fin.failed, fin.cancelled], [8, 8, [], false]);
+    eq(fin.zips.map((z) => [z.name, z.count]), [["PixAI_测试_20261103-140509.zip", 8]]);
+    const d = BG.downloads.find((x) => x.id === fin.zips[0].id);
+    eq([d.filename, d.state, d.conflictAction, d.saveAs], ["PixAI/测试/PixAI_测试_20261103-140509.zip", "complete", "uniquify", false]);
+    ok(d.url.startsWith("blob:" + location.origin + "/"), "a blob URL of the extension origin");
+    ok(BG.maxInflight >= 1 && BG.maxInflight <= 3, "at most 3 parallel fetches, saw " + BG.maxInflight);
+    const types = new Set(job.messages.map((m) => m.type));
+    ok(types.has("progress") && types.has("saving") && types.has("part"), [...types].join());
+    const part = job.messages.find((m) => m.type === "part");
+    eq(part.indices.slice().sort(), [0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+
+  test("a link outside the allowed hosts and a 404 are reported per file", async () => {
+    const list = entries(IDS.slice(0, 3));
+    list[1].url = "https://evil.example/x.png";
+    list.push({ url: `${API}/img/9999999999.gif`, name: "missing.gif", time: 0, index: 3 });
+    const fin = await contentJob(zipStart(list)).done;
+    eq(fin.done, 2);
+    eq(fin.failed.map((f) => [f.index, f.error]).sort(), [[1, "BAD_URL"], [3, "HTTP_404"]]);
+  });
+
+  test("an unsafe sub-folder fails the whole job without packing", async () => {
+    const fin = await contentJob(zipStart(entries(IDS.slice(0, 2)), { dir: "../evil" })).done;
+    eq(fin.done, 0);
+    eq(fin.failed.map((f) => f.error), ["BAD_PATH", "BAD_PATH"]);
+  });
+
+  test("two jobs at once share the 3 download slots", async () => {
+    BG.maxInflight = 0;
+    const a = contentJob(zipStart(entries(IDS), { baseName: "PixAI_A_1" }));
+    const b = contentJob(zipStart(entries(IDS), { baseName: "PixAI_B_1" }));
+    const [fa, fb] = await Promise.all([a.done, b.done]);
+    eq([fa.done, fb.done], [8, 8]);
+    ok(BG.maxInflight <= 3, "parallel fetches across jobs: " + BG.maxInflight);
+    eq(BG.offscreenCreated, 1, "the document is reused");
+  });
+
+  test("cancel from the page: packed files are still saved, the rest is not fetched", async () => {
+    const many = entries(IDS.concat(IDS, IDS)).map((e, i) => Object.assign(e, { name: `x_${i}.png`, index: i }));
+    const job = contentJob(zipStart(many, { baseName: "PixAI_cancel_1" }, { concurrency: 1 }));
+    while (!job.messages.some((m) => m.type === "progress" && m.done >= 3)) await sleep(20);
+    job.port.postMessage({ type: "cancel" });
+    const fin = await job.done;
+    eq(fin.cancelled, true);
+    ok(fin.done >= 3 && fin.done < 24, "packed before cancel: " + fin.done);
+    eq(fin.failed, []);
+    eq(fin.zips.length, 1);
+  });
+
+  test("an archive that cannot be written fails its files with Chrome's reason", async () => {
+    BG.failNextSave = "FILE_NO_SPACE";
+    const fin = await contentJob(zipStart(entries(IDS.slice(0, 3)), { baseName: "PixAI_nospace_1" })).done;
+    eq(fin.done, 0);
+    eq(fin.failed.map((f) => f.error), ["FILE_NO_SPACE", "FILE_NO_SPACE", "FILE_NO_SPACE"]);
+    eq(fin.zips, []);
+  });
+
+  test("the offscreen document going away mid-job finishes the job as disconnected", async () => {
+    BG.saveDelay = 400;
+    const job = contentJob(zipStart(entries(IDS.slice(0, 4)), { baseName: "PixAI_gone_1" }));
+    while (!job.messages.some((m) => m.type === "saving")) await sleep(10);
+    await chrome.offscreen.closeDocument();
+    const fin = await job.done;
+    BG.saveDelay = 0;
+    eq(fin.done, 0);
+    eq(fin.failed.map((f) => f.error), ["DISCONNECTED", "DISCONNECTED", "DISCONNECTED", "DISCONNECTED"]);
+    // the next job starts a new document
+    const again = await contentJob(zipStart(entries(IDS.slice(0, 2)), { baseName: "PixAI_again_1" })).done;
+    eq(again.done, 2);
+    eq(BG.offscreenCreated, 2);
+  });
+
+  test("closing the page tab cancels its job", async () => {
+    const many = entries(IDS.concat(IDS)).map((e, i) => Object.assign(e, { name: `t_${i}.png`, index: i }));
+    const job = contentJob(zipStart(many, { baseName: "PixAI_tab_1" }, { concurrency: 1 }));
+    while (!job.messages.some((m) => m.type === "progress")) await sleep(10);
+    const before = BG.downloads.length;
+    job.kill();
+    await sleep(1500);
+    const saved = BG.downloads.slice(before);
+    eq(saved.length, 1, "the packed part is saved");
+    ok(saved[0].filename.endsWith("PixAI_tab_1.zip"), saved[0].filename);
+  });
+
+  test("a page closed while the offscreen document is still starting cancels its job", async () => {
+    await chrome.offscreen.closeDocument().catch(() => {});
+    await sleep(50);
+    const created = BG.offscreenCreated;
+    const before = BG.downloads.length;
+    const oldPort = BG.framePort;
+    const job = contentJob(zipStart(entries(IDS), { baseName: "PixAI_early_1" }));
+    await sleep(5); // the start message has arrived ...
+    ok(BG.framePort === oldPort, "... and the new document has not connected yet");
+    job.kill();
+    await sleep(2000);
+    eq(BG.offscreenCreated, created + 1, "a new document was started");
+    eq(BG.downloads.slice(before).filter((d) => d.filename.includes("PixAI_early_1")).length, 0, "nothing packed or saved");
+  });
+
+  test("loose files still work and a slot is free afterwards", async () => {
+    const start = { label: "loose", concurrency: 3, entries: IDS.slice(0, 3).map((id, index) => ({ url: img(id), path: `PixAI/散装/${index}.png`, index })) };
+    const fin = await contentJob(start).done;
+    eq([fin.done, fin.failed], [3, []]);
+  });
+
+  const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47];
+  const RIFF_MAGIC = [0x52, 0x49, 0x46, 0x46];
+
+  test("separate files with toPng: a still WebP is saved as PNG through the offscreen document", async () => {
+    const before = BG.downloads.length;
+    const start = { label: "png", concurrency: 2, entries: [
+      { url: img("2000000000000000101", "webp"), path: "PixAI/转换/a.webp", toPng: true, index: 0 },
+      { url: img("2000000000000000102", "png"), path: "PixAI/转换/b.png", toPng: true, index: 1 },
+      { url: img("2000000000000000103", "webp"), path: "PixAI/转换/c.webp", toPng: false, index: 2 }
+    ] };
+    const fin = await contentJob(start).done;
+    eq([fin.done, fin.failed], [3, []]);
+    const rows = BG.downloads.slice(before).sort((x, y) => x.filename.localeCompare(y.filename));
+    eq(rows.map((r) => r.filename), ["PixAI/转换/a.png", "PixAI/转换/b.png", "PixAI/转换/c.webp"]);
+    eq(rows.map((r) => r.magic), [PNG_MAGIC, PNG_MAGIC, RIFF_MAGIC]);
+    ok(rows[0].url.startsWith("blob:") && rows[1].url.startsWith("blob:") && !rows[2].url.startsWith("blob:"), "converted files come from blob URLs");
+  });
+
+  test("separate files with toPng: network errors are retried, a 404 fails instead of saving WebP", async () => {
+    const flaky = img("2000000000000000121", "webp");
+    BG.failFetches[flaky] = 2; // the third try works
+    const before = BG.downloads.length;
+    const fin = await contentJob({ label: "retry", concurrency: 2, entries: [
+      { url: flaky, path: "PixAI/重试/a.webp", toPng: true, index: 0 },
+      { url: `${API}/img/9999999999.gif`, path: "PixAI/重试/b.webp", toPng: true, index: 1 }
+    ] }).done;
+    eq(BG.failFetches[flaky], 0, "both failing fetches were used up");
+    eq(fin.done, 1);
+    eq(fin.failed.map((f) => [f.index, f.error]), [[1, "HTTP_404"]]);
+    const rows = BG.downloads.slice(before);
+    eq(rows.map((r) => [r.filename, r.magic]), [["PixAI/重试/a.png", PNG_MAGIC]], "nothing saved for the 404, and no WebP fallback");
+  });
+
+  test("ZIP with toPng: WebP entries are packed as PNG", async () => {
+    const list = [
+      { url: img("2000000000000000111", "webp"), name: "风景_1.webp", time: 0, index: 0, toPng: true },
+      { url: img("2000000000000000112", "webp"), name: "风景_2.webp", time: 0, index: 1, toPng: false },
+      { url: img("2000000000000000113"), name: "风景_3.png", time: 0, index: 2, toPng: false }
+    ];
+    const fin = await contentJob(zipStart(list, { baseName: "PixAI_png_1" })).done;
+    eq([fin.done, fin.failed], [3, []]);
+    const z = BG.downloads.find((d) => d.id === fin.zips[0].id);
+    eq(z.filename, "PixAI/测试/PixAI_png_1.zip");
+  });
+
+  test("show in folder: our archive, anything else opens the download folder", async () => {
+    const id = BG.downloads.find((d) => d.state === "complete" && d.filename.endsWith(".zip")).id;
+    const reply = (msg) => new Promise((resolve) => chrome.runtime.onMessage.emit(msg, { id: "pgm-bg" }, resolve));
+    await reply({ type: "pgm-show", id });
+    await reply({ type: "pgm-show", id: 99999 });
+    eq(BG.shown.slice(-2), [id, "default"]);
+  });
+
+  async function run() {
+    const list = document.getElementById("list");
+    let pass = 0, fail = 0;
+    for (const t of tests) {
+      const li = document.createElement("li");
+      try {
+        await Promise.race([t.fn(), sleep(20000).then(() => { throw new Error("timeout"); })]);
+        pass++;
+        li.className = "pass";
+        li.textContent = "PASS " + t.name;
+      } catch (e) {
+        fail++;
+        li.className = "fail";
+        li.textContent = "FAIL " + t.name;
+        const err = document.createElement("div");
+        err.className = "err";
+        err.textContent = String((e && e.stack) || e);
+        li.appendChild(err);
+      }
+      list.appendChild(li);
+    }
+    const r = document.getElementById("result");
+    r.textContent = "PASS " + pass + " / FAIL " + fail;
+    r.className = fail ? "fail" : "pass";
+  }
+  run();
+})();
+</script>
+</body>
+</html>

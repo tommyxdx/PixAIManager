@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_appName__",
+  "version": "1.1.0",
+  "description": "__MSG_appDesc__",
+  "default_locale": "en",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "downloads",
+    "storage",
+    "unlimitedStorage",
+    "offscreen"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://pixai.art/*"
+      ],
+      "run_at": "document_idle",
+      "js": [
+        "src/ns.js",
+        "src/i18n.js",
+        "src/naming.js",
+        "src/settings.js",
+        "src/api.js",
+        "src/folders.js",
+        "src/downloads.js",
+        "src/ui/strings.js",
+        "src/ui/styles.js",
+        "src/ui/dom.js",
+        "src/ui/dialogs.js",
+        "src/ui/app.js",
+        "src/main.js"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "__MSG_actionTitle__",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
+}

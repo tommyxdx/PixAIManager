@@ -1,0 +1,1110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PGM unit tests</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; background: #111; color: #ddd; }
+  #result { font-size: 20px; font-weight: 700; margin-bottom: 12px; }
+  .pass { color: #4ade80; }
+  .fail { color: #f87171; }
+  li { margin: 2px 0; }
+  .err { color: #fca5a5; white-space: pre-wrap; margin-left: 1em; }
+</style>
+</head>
+<body>
+<div id="result">running…</div>
+<ul id="list"></ul>
+
+<script>
+  // In-memory chrome.storage for settings.js and folders.js. No network is touched by these tests:
+  // API tests replace fetch with a fake.
+  (function () {
+    const data = new Map();
+    const listeners = [];
+    const clone = (v) => (v === undefined ? undefined : structuredClone(v));
+    function keyList(keys) {
+      if (keys == null) return [...data.keys()];
+      if (typeof keys === "string") return [keys];
+      return Array.isArray(keys) ? keys : Object.keys(keys);
+    }
+    globalThis.chrome = {
+      runtime: { id: "unit" },
+      storage: {
+        local: {
+          async get(keys) {
+            const out = {};
+            for (const k of keyList(keys)) if (data.has(k)) out[k] = clone(data.get(k));
+            return out;
+          },
+          async set(obj) {
+            const changes = {};
+            for (const [k, v] of Object.entries(obj)) {
+              changes[k] = { oldValue: clone(data.get(k)), newValue: clone(v) };
+              data.set(k, clone(v));
+            }
+            listeners.forEach((fn) => fn(changes, "local"));
+          },
+          async remove(keys) {
+            for (const k of keyList(keys)) data.delete(k);
+          },
+          async clear() {
+            data.clear();
+          }
+        },
+        onChanged: {
+          addListener: (fn) => listeners.push(fn),
+          removeListener: (fn) => listeners.splice(listeners.indexOf(fn) >>> 0, 1)
+        }
+      }
+    };
+  })();
+</script>
+<script>
+  // Load the scripts with a cache-buster so edits show up on reload, then run the tests.
+  document.write(["ns", "i18n", "naming", "queue", "settings", "api", "folders", "zip", "packer", "convert"]
+    .map((n) => '<script src="../src/' + n + '.js?v=' + Date.now() + '"><\/script>').join(""));
+</script>
+<script>
+(function () {
+  "use strict";
+  const tests = [];
+  const test = (name, fn) => tests.push({ name, fn });
+  const N = PGM.naming;
+  const Q = PGM.queue;
+  const U = PGM.util;
+  const A = PGM.api;
+  const F = PGM.folders;
+  const TOKEN_KEY = "https://api.pixai.art:token";
+  PGM.i18n.lang = "zh"; // the expected names below are the Chinese defaults, whatever the browser language
+
+  function eq(actual, expected, msg) {
+    const a = JSON.stringify(actual);
+    const b = JSON.stringify(expected);
+    if (a !== b) throw new Error((msg ? msg + ": " : "") + "expected " + b + ", got " + a);
+  }
+  function ok(value, msg) {
+    if (!value) throw new Error(msg || "expected a truthy value");
+  }
+  async function rejects(promise, code) {
+    try {
+      await promise;
+    } catch (e) {
+      if (code && e.code !== code) throw new Error("expected code " + code + ", got " + (e.code || e.message));
+      return;
+    }
+    throw new Error("expected a rejection" + (code ? " with " + code : ""));
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Replaces fetch for one test. The API base points at a closed local port, so a missed stub
+  // can never reach a real server.
+  async function withFetch(handler, fn) {
+    const calls = [];
+    const originalFetch = globalThis.fetch;
+    const originalBase = globalThis.PGM_TEST_API_BASE;
+    globalThis.PGM_TEST_API_BASE = "http://127.0.0.1:1";
+    globalThis.fetch = async (url, init) => {
+      const call = { url: new URL(String(url)), init: init || {}, body: init && init.body ? JSON.parse(init.body) : undefined };
+      calls.push(call);
+      const r = await handler(call, calls.length);
+      if (r instanceof Error) throw r;
+      return new Response(r.body === undefined ? "" : JSON.stringify(r.body), { status: r.status || 200, headers: r.headers || {} });
+    };
+    try {
+      await fn(calls);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalBase === undefined) delete globalThis.PGM_TEST_API_BASE;
+      else globalThis.PGM_TEST_API_BASE = originalBase;
+    }
+  }
+
+  const T = new Date(2026, 10, 3, 14, 5, 9).toISOString(); // local 2026-11-03 14:05:09
+  const P1 = "masterpiece, best quality, 1girl, silver hair, (smile:1.2), <lora:abc:0.7>";
+  const img = (extra) => Object.assign({ source: "task", taskId: "111", artworkId: null, mediaId: "222",
+    index: 1, count: 1, ext: "png", createdAt: T, prompt: P1, url: "https://images-ng.pixai.art/images/orig/a" }, extra);
+  const builtPaths = [];
+  const path = (image, opts) => {
+    const p = N.buildPath(image, Object.assign({ settings: {} }, opts));
+    builtPaths.push(p);
+    return p;
+  };
+
+  // ---- naming: EXT_SPEC section 3 examples -----------------------------------
+
+  test("example: folder 风景", () => {
+    eq(path(img(), { folderName: "风景" }), "PixAI/风景/风景_20261103-140509_1girl_silver-hair_smile.png");
+  });
+  test("example: no folder, 4 images, index 2", () => {
+    eq(path(img({ index: 2, count: 4 })), "PixAI/生成记录/20261103-140509_1girl_silver-hair_smile_2.png");
+  });
+  test("example: natural language prompt", () => {
+    const p = "A girl holding flowers in a sunny garden";
+    eq(N.promptTags(p, { count: 3 }).join("_"), "A_girl_holding");
+    eq(path(img({ prompt: p })), "PixAI/生成记录/20261103-140509_A_girl_holding.png");
+  });
+  test("example: CON and a<b>:c*? sanitized", () => {
+    eq(N.sanitize("CON"), "_CON");
+    eq(N.sanitize("a<b>:c*?"), "a-b-c");
+    eq(path(img(), { folderName: "CON" }).split("/")[1], "_CON");
+    eq(path(img(), { folderName: "a<b>:c*?" }), "PixAI/a-b-c/a-b-c_20261103-140509_1girl_silver-hair_smile.png");
+  });
+
+  // ---- naming: edge cases ------------------------------------------------------
+
+  test("empty prompt", () => {
+    eq(N.promptTags(""), []);
+    eq(N.promptTags(null), []);
+    eq(path(img({ prompt: "" })), "PixAI/生成记录/20261103-140509.png");
+  });
+  test("only quality tags", () => {
+    eq(N.promptTags("masterpiece, best quality, highres, absurdres, 8k, very aesthetic, year_2024, Year 2025"), []);
+    eq(path(img({ prompt: "masterpiece, best_quality" }), { folderName: "x" }), "PixAI/x/x_20261103-140509.png");
+  });
+  test("CJK tags and separators", () => {
+    eq(N.promptTags("女孩，银发、微笑；樱花"), ["女孩", "银发", "微笑"]);
+    eq(N.promptTags("女孩\n银发;微笑", { count: 5 }), ["女孩", "银发", "微笑"]);
+  });
+  test("200-char prompt stays within 120 chars", () => {
+    const long = Array.from({ length: 12 }, (_, i) => "longtag" + i + " extra words here").join(", ");
+    ok(long.length >= 200, "prompt is long");
+    const p = path(img({ prompt: long }), { folderName: "风景", settings: { promptCount: 5 } });
+    const base = p.split("/").pop().replace(/\.png$/, "");
+    ok(Array.from(base).length <= 120, "base too long: " + base.length);
+    ok(base.startsWith("风景_20261103-140509_longtag0"), base);
+    const hard = path(img(), { settings: { template: "x".repeat(200) + "_{time}" } });
+    eq(Array.from(hard.split("/").pop().replace(/\.png$/, "")).length, 120);
+  });
+  test("reserved names and sanitize rules", () => {
+    eq(N.sanitize("lpt1"), "_lpt1");
+    eq(N.sanitize("com3.txt"), "_com3.txt");
+    eq(N.sanitize("nul"), "_nul");
+    eq(N.sanitize("CONSOLE"), "CONSOLE");
+    eq(N.sanitize("  ..name..  "), "name");
+    eq(N.sanitize("文件/名"), "文件-名");
+    eq(N.sanitize("a\u0000b\u202ec"), "a-b-c");
+    eq(N.sanitize("___x___"), "x");
+    eq(N.sanitize("a---b"), "a-b");
+    eq(N.sanitize(undefined), "");
+  });
+  test("prompt cleanup: weights, brackets, lora, score, BREAK, @image", () => {
+    eq(N.promptTags("(masterpiece:1.2), [detailed], {best quality}, (red eyes:1.3), \\(artist\\)", { count: 5 }), ["red-eyes", "artist"]);
+    eq(N.promptTags("score_9, score_8_up, score_7_up, 1girl"), ["1girl"]);
+    eq(N.promptTags("@image1 girl, BREAK, smile"), ["girl", "smile"]);
+    eq(N.promptTags("<lora:a:0.5> <embedding:b>, cat"), ["cat"]);
+    eq(N.promptTags("(a, b:1.1), c"), ["a", "b", "c"]);
+  });
+  test("tag shaping: underscores, spaces, 24 chars, count, dedupe", () => {
+    eq(N.promptTags("silver_hair, very  long   hair"), ["silver-hair", "very-long-hair"]);
+    eq(N.promptTags("a".repeat(40)), ["a".repeat(24)]);
+    eq(N.promptTags("1girl, solo, smile", { count: 2 }), ["1girl", "solo"]);
+    eq(N.promptTags("masterpiece, 1girl", { skipQuality: false }), ["masterpiece", "1girl"]);
+    eq(N.promptTags("1girl, 1girl, smile"), ["1girl", "smile"]);
+    eq(N.promptTags("red apple on table"), ["red-apple-on-table"]);
+  });
+  test("formatTime", () => {
+    eq(N.formatTime("nope"), "unknown-time");
+    eq(N.formatTime(null), "unknown-time");
+    eq(N.formatTime(""), "unknown-time");
+    eq(N.formatTime(new Date(2026, 0, 2, 3, 4, 5)), "20260102-030405");
+    eq(N.formatTime(T), "20261103-140509");
+  });
+  test("templates, directories and extensions", () => {
+    eq(path(img({ index: 2, count: 4 }), { settings: { template: "{time}_{index}" } }), "PixAI/生成记录/20261103-140509_2.png");
+    eq(path(img({ prompt: "" }), { settings: { template: "{prompt}" } }), "PixAI/生成记录/111_222.png");
+    eq(path(img(), { settings: { template: "{folder}-{time}" } }), "PixAI/生成记录/20261103-140509.png");
+    eq(path(img(), { settings: { template: "{foo}_{time}" } }), "PixAI/生成记录/{foo}_20261103-140509.png");
+    eq(path(img(), { folderName: "风景", settings: { directory: "../evil/{folder}", template: "{time}" } }), "evil/风景/20261103-140509.png");
+    eq(path(img(), { folderName: "风景", settings: { directory: "", template: "{time}" } }), "20261103-140509.png");
+    const win = path(img(), { folderName: "风景", settings: { directory: "C:\\Users\\{folder}", template: "{time}" } });
+    ok(!/^[a-z]:/i.test(win) && Q.isSafePath(win), win);
+    eq(path(img({ ext: "webp" }), { settings: { template: "{time}" } }), "PixAI/生成记录/20261103-140509.webp");
+    eq(path(img({ ext: "exe;" }), { settings: { template: "{time}" } }), "PixAI/生成记录/20261103-140509.png");
+    eq(path(img({ ext: "", isVideo: true }), { settings: { template: "{time}" } }), "PixAI/生成记录/20261103-140509.mp4");
+    eq(path(img({ source: "artwork", taskId: null, artworkId: "333", mediaId: "444" }), { settings: { template: "{task}_{media}" } }), "PixAI/生成记录/333_444.png");
+    eq(path(img(), { folderName: "a/b", settings: { template: "{time}" } }), "PixAI/a-b/20261103-140509.png");
+  });
+  test("example() helper", () => {
+    ok(/^PixAI\/风景\/风景_\d{8}-\d{6}_1girl_silver-hair_smile_2\.png$/.test(N.example({}, "风景")), N.example({}, "风景"));
+  });
+
+  // ---- queue -----------------------------------------------------------------
+
+  test("queue respects concurrency", async () => {
+    let inflight = 0;
+    let max = 0;
+    let progress = 0;
+    const q = Q.createQueue({
+      concurrency: 3,
+      run: async () => {
+        inflight++;
+        max = Math.max(max, inflight);
+        await sleep(10);
+        inflight--;
+      },
+      onProgress: () => progress++
+    });
+    const r = await q.start(Array.from({ length: 10 }, (_, i) => ({ i })));
+    eq([r.done, r.failed.length, r.total, r.cancelled, max, progress], [10, 0, 10, false, 3, 10]);
+  });
+  test("queue records failures and keeps going", async () => {
+    const q = Q.createQueue({
+      concurrency: 2,
+      run: async (e) => {
+        await sleep(1);
+        if (e.fail === "code") throw new PGM.PGMError(0, "BAD_URL", "x");
+        if (e.fail) throw new Error("boom");
+      }
+    });
+    const r = await q.start([{}, { fail: true }, {}, { fail: "code" }, {}]);
+    eq([r.done, r.failed.map((f) => f.error)], [3, ["boom", "BAD_URL"]]);
+  });
+  test("queue cancel stops new entries", async () => {
+    let started = 0;
+    const q = Q.createQueue({
+      concurrency: 2,
+      run: async () => {
+        started++;
+        await sleep(5);
+      },
+      onProgress: (p) => {
+        if (p.done === 4) q.cancel();
+      }
+    });
+    const r = await q.start(Array.from({ length: 20 }, () => ({})));
+    ok(r.cancelled, "cancelled flag");
+    ok(r.done >= 4 && r.done <= 6, "done " + r.done);
+    ok(started < 20, "started " + started);
+  });
+  test("queue with no entries, and single start", async () => {
+    const q = Q.createQueue({ concurrency: 3, run: async () => {} });
+    eq(await q.start([]), { done: 0, failed: [], total: 0, cancelled: false });
+    await rejects(q.start([{}]));
+  });
+
+  // ---- chunking, URL and path validation -------------------------------------
+
+  test("chunk helper", () => {
+    eq(U.chunk(Array.from({ length: 120 }, (_, i) => i), 50).map((c) => c.length), [50, 50, 20]);
+    eq(U.chunk([], 50), []);
+    eq(U.chunk([1, 2, 3], 0), [[1], [2], [3]]);
+  });
+  test("URL host validation", () => {
+    ok(U.isAllowedUrl("https://images-ng.pixai.art/images/orig/x"));
+    ok(U.isAllowedUrl("https://cdn.pixai.art/a.png"));
+    ok(U.isAllowedUrl("https://api.pixai.art/v1/media/1/image"));
+    for (const bad of [
+      "http://images-ng.pixai.art/x",
+      "https://images-ng.pixai.art.evil.com/x",
+      "https://evil.com/?u=https://images-ng.pixai.art/",
+      "https://user:pw@images-ng.pixai.art/x",
+      "https://images-ng.pixai.art:8443/x",
+      "https://pixai.art/x",
+      "javascript:alert(1)",
+      "data:image/png;base64,AAAA",
+      "",
+      null
+    ]) ok(!U.isAllowedUrl(bad), "should reject " + bad);
+  });
+  test("URL validation in test mode", () => {
+    const before = globalThis.PGM_TEST_API_BASE;
+    globalThis.PGM_TEST_API_BASE = "http://127.0.0.1:18765";
+    try {
+      ok(U.isAllowedUrl("http://127.0.0.1:18765/img/1.png"));
+      ok(!U.isAllowedUrl("http://127.0.0.1:9999/img/1.png"));
+    } finally {
+      if (before === undefined) delete globalThis.PGM_TEST_API_BASE;
+      else globalThis.PGM_TEST_API_BASE = before;
+    }
+    ok(!U.isAllowedUrl("http://127.0.0.1:18765/img/1.png"));
+  });
+  test("path validation", () => {
+    ok(Q.isSafePath("PixAI/风景/a_b.png"));
+    for (const bad of ["/abs.png", "../x.png", "a/../b.png", "a/./b.png", "C:/x.png", "a\\b.png", "a//b.png",
+      "CON.png", "a/b./c.png", "a/ b/c.png", "", null, "x".repeat(401)]) ok(!Q.isSafePath(bad), "should reject " + bad);
+    eq(Q.checkEntry({ url: "https://images-ng.pixai.art/x", path: "a/b.png" }), null);
+    eq(Q.checkEntry({ url: "https://evil.com/x", path: "a/b.png" }), "BAD_URL");
+    eq(Q.checkEntry({ url: "https://images-ng.pixai.art/x", path: "../b.png" }), "BAD_PATH");
+  });
+  test("every built path is safe", () => {
+    ok(builtPaths.length > 10, "paths collected");
+    for (const p of builtPaths) ok(Q.isSafePath(p), "unsafe: " + p);
+  });
+
+  // ---- i18n ------------------------------------------------------------------
+
+  test("i18n lookup, vars and fallbacks", () => {
+    const lang = PGM.i18n.lang;
+    try {
+      PGM.i18n.lang = "zh";
+      eq(PGM.t("delete.title", { n: 5 }), "永久删除 5 张图片？");
+      eq(PGM.t("delete.summary", { a: 3, p: 1, f: 0 }), "已删除 3 张，跳过 1 张已发布，失败 0 张");
+      ok(PGM.t("settings.templateHelp").includes("{folder}"), "literal tokens survive");
+      eq(PGM.t("no.such.key"), "no.such.key");
+      eq(PGM.t.error({ code: "LOGIN_REQUIRED" }), "请先登录 pixai.art");
+      eq(PGM.t.error({ code: "HTTP_502", status: 502 }), "请求失败（HTTP 502）");
+      PGM.i18n.add("zh", { "unit.only": "仅中文" });
+      PGM.i18n.lang = "en";
+      eq(PGM.t("unit.only"), "仅中文");
+      eq(PGM.t("delete.ack"), "I understand deleted images cannot be recovered");
+      PGM.i18n.add({ en: { "unit.only": "English" } });
+      eq(PGM.t("unit.only"), "English");
+      ok(Object.keys(PGM.strings.zh).every((k) => k in PGM.strings.en), "every zh key has an en translation");
+    } finally {
+      PGM.i18n.lang = lang;
+    }
+  });
+
+  // ---- settings --------------------------------------------------------------
+
+  test("settings normalize, set and get", async () => {
+    const n = PGM.settings.normalize({ promptCount: 7, concurrency: 9, pageSize: 500, template: "", noFolderName: "a/b", skipQuality: "no" });
+    eq([n.promptCount, n.concurrency, n.pageSize, n.template, n.noFolderName, n.skipQuality], [3, 3, 50, "{folder}_{time}_{prompt}", "a-b", true]);
+    eq((await PGM.settings.get()).pageSize, 50);
+    await PGM.settings.set({ promptCount: 4 });
+    eq((await PGM.settings.get()).promptCount, 4);
+    eq(PGM.settings.current().promptCount, 4);
+    await PGM.settings.reset();
+    eq((await PGM.settings.get()).promptCount, 3);
+  });
+
+  // ---- API normalization -----------------------------------------------------
+
+  test("normalizeTask: images, favorites, published, urls", () => {
+    const row = {
+      id: "10", status: "completed", createdAt: "2026-11-01T00:00:00.000Z", imageType: "webp", artworkCount: 1,
+      outputs: { mediaIds: ["1", "2", "3"], mediaUrls: ["https://images-ng.pixai.art/gi/orig/a", null, "https://evil.com/x.png"] },
+      parameters: { prompts: "p" },
+      bookmarkState: { favoritedAt: "x", mediaItems: [{ mediaId: "2", favoritedAt: null }] }
+    };
+    const out = A.normalizeTask(row);
+    eq(out.map((i) => [i.key, i.index, i.count, i.ext, i.favorited, i.published, i.url]), [
+      ["task:10:1", 1, 3, "webp", true, true, "https://images-ng.pixai.art/gi/orig/a"],
+      ["task:10:2", 2, 3, "webp", false, true, ""],
+      ["task:10:3", 3, 3, "webp", true, true, ""]
+    ]);
+    eq(Object.keys(out[0]).sort(), ["artworkId", "count", "createdAt", "ext", "favorited", "index", "isVideo", "key",
+      "mediaId", "prompt", "published", "source", "taskId", "thumb", "url"]);
+    eq(A.normalizeTask({ ...row, status: "failed" }), []);
+  });
+  test("normalizeTask: prompt fallbacks and video", () => {
+    const base = { id: "7", status: "completed", outputs: { mediaIds: ["1"], mediaUrls: [null] } };
+    eq(A.normalizeTask({ ...base, parameters: { chat: { prompts: "chat p" } } })[0].prompt, "chat p");
+    eq(A.normalizeTask({ ...base, prompts: "preview" })[0].prompt, "preview");
+    eq(A.normalizeTask(base)[0].prompt, "");
+    eq(A.normalizeTask({ ...base, isPublished: true })[0].published, true);
+    const v = A.normalizeTask({ ...base, bookmarkState: { favoritedAt: "y", mediaItems: [] },
+      outputs: { mediaIds: ["5"], mediaUrls: [null], videoMediaId: "9" } });
+    eq(v.map((i) => [i.key, i.isVideo, i.ext, i.favorited, i.count]), [["task:7:9", true, "mp4", true, 1]]);
+  });
+  test("normalizeArtworkItem", () => {
+    const row = { refType: "artwork", effectiveStatus: "available", artwork: { id: "30", mediaId: "40", prompts: "p",
+      createdAt: "2026-10-01T00:00:00.000Z", videoMediaId: null,
+      media: { publicUrl: "https://images-ng.pixai.art/images/orig/u", thumbnailUrl: "https://images-ng.pixai.art/images/thumb/u" } } };
+    const i = A.normalizeArtworkItem(row);
+    eq([i.key, i.source, i.taskId, i.artworkId, i.published, i.ext, i.thumb],
+      ["artwork:30:40", "artwork", null, "30", true, "png", "https://images-ng.pixai.art/images/thumb/u"]);
+    eq(A.normalizeArtworkItem({ ...row, effectiveStatus: "unavailable" }), null);
+    eq(A.normalizeArtworkItem({ ...row, artwork: null }), null);
+    eq(A.normalizeArtworkItem({ ...row, refType: "model" }), null);
+  });
+  test("queryString and imageExt", () => {
+    eq(A.queryString({ ids: ["1", "2"], favorited: "true", empty: "", none: undefined, n: 5, b: true }),
+      "?ids[0]=1&ids[1]=2&favorited=true&n=5&b=true");
+    eq(A.queryString({}), "");
+    eq([A.imageExt("image/webp"), A.imageExt("png"), A.imageExt(null, "animate"), A.imageExt("jpeg"), A.imageExt(undefined)],
+      ["webp", "png", "webp", "jpg", "png"]);
+  });
+
+  // ---- API requests (fake fetch) ---------------------------------------------
+
+  test("request: auth header, errors, route guard, token rotation", async () => {
+    localStorage.setItem(TOKEN_KEY, "unit.token.a");
+    try {
+      await withFetch((call) => {
+        const p = call.url.pathname;
+        if (p === "/v2/user/me") return { body: { id: 5, username: "u", displayName: "" }, headers: { token: "unit.token.b" } };
+        if (p === "/v2/task/search") return { status: 400, body: { code: "BAD_REQUEST", message: "bad" } };
+        if (p === "/v2/task/123") return { status: 401, body: { code: "UNAUTHORIZED" } };
+        return new TypeError("Failed to fetch");
+      }, async (calls) => {
+        eq(await A.me(), { id: "5", name: "u" });
+        eq(calls[0].init.headers.Authorization, "Bearer unit.token.a");
+        eq(calls[0].init.credentials, "include");
+        eq(localStorage.getItem(TOKEN_KEY), "unit.token.b");
+        await rejects(A.get("/task/search", { first: 1 }), "BAD_REQUEST");
+        await rejects(A.get("/task/123"), "LOGIN_REQUIRED");
+        await rejects(A.get("/collection/list/1"), "NETWORK");
+        await rejects(A.request("POST", "/task/create", { body: {} }), "ROUTE_NOT_ALLOWED");
+        await rejects(A.request("POST", "/artwork/from-task", { body: {} }), "ROUTE_NOT_ALLOWED");
+        eq(calls.length, 4, "the guarded routes never reach fetch");
+      });
+    } finally {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  });
+  test("GET retries 503 once; POST never retries", async () => {
+    await withFetch((call, n) => {
+      if (call.init.method === "GET") return n === 1 ? { status: 503, body: {} } : { body: { id: "1" } };
+      return { status: 503, body: {} };
+    }, async (calls) => {
+      eq((await A.me()).id, "1");
+      eq(calls.length, 2);
+      await rejects(A.request("POST", "/task/1/delete"), "HTTP_503");
+      eq(calls.length, 3);
+    });
+  });
+  test("searchTasks: query, media batch, thumbnails, video", async () => {
+    const rows = [
+      { id: "10", status: "completed", createdAt: "2026-11-01T00:00:00.000Z", imageType: "png",
+        outputs: { mediaIds: ["1", "2"], mediaUrls: ["https://images-ng.pixai.art/images/orig/a", null] },
+        parameters: { prompts: "1girl" }, bookmarkState: { favoritedAt: null, mediaItems: [{ mediaId: "1", favoritedAt: "z" }] } },
+      { id: "11", status: "completed", createdAt: "2026-11-01T00:00:00.000Z",
+        outputs: { mediaIds: ["5"], mediaUrls: ["https://images-ng.pixai.art/images/orig/poster"], videoMediaId: "9" } }
+    ];
+    const media = (id, type) => ({ id, type, urls: [
+      { variant: "PUBLIC", url: "https://images-ng.pixai.art/images/orig/m" + id },
+      { variant: "THUMBNAIL", url: "https://images-ng.pixai.art/images/thumb/m" + id }] });
+    await withFetch((call) => {
+      if (call.url.pathname === "/v2/task/search") return { body: { data: rows, pageInfo: { hasNextPage: true, endCursor: "c2" } } };
+      if (call.url.pathname === "/v2/media/batch") return { body: [media("1", "IMAGE"), media("2", "IMAGE"), media("5", "IMAGE"), media("9", "VIDEO")] };
+      return { status: 404, body: {} };
+    }, async (calls) => {
+      const r = await A.searchTasks({ keyword: " cat ", createdAfter: "2026-11-01", createdBefore: "2026-11-02", tab: "image" });
+      const q = calls[0].url.searchParams;
+      eq([q.get("first"), q.get("status"), q.get("withParameters"), q.get("keyword"), q.get("tab"), q.get("favorited")],
+        ["50", "completed", "true", "cat", "image", null]);
+      eq(q.get("createdAfter"), new Date(2026, 10, 1).toISOString());
+      eq(q.get("createdBefore"), new Date(2026, 10, 3).toISOString());
+      eq(calls[1].init.credentials, "omit");
+      ok(!calls[1].init.headers.Authorization, "media batch has no Authorization");
+      eq(calls[1].url.search.includes("ids[0]="), true);
+      eq([r.endCursor, r.hasNextPage, r.images.length], ["c2", true, 3]);
+      eq(r.images[1].url, "https://images-ng.pixai.art/images/orig/m2");
+      eq(r.images[0].thumb, "https://images-ng.pixai.art/images/thumb/m1");
+      const v = r.images[2];
+      eq([v.isVideo, v.url, v.thumb], [true, "https://images-ng.pixai.art/images/orig/m9", "https://images-ng.pixai.art/images/thumb/m5"]);
+      const fav = await A.searchTasks({ favorited: true });
+      eq(calls[2].url.searchParams.get("favorited"), "true");
+      eq(fav.images.map((i) => i.key), ["task:10:1"], "unstarred siblings dropped");
+    });
+  });
+  test("setFavorite: chunks of 50, video without mediaId", async () => {
+    const images = Array.from({ length: 119 }, (_, i) => img({ key: "task:t" + i + ":m" + i, taskId: "t" + i, mediaId: "m" + i }));
+    images.push(img({ key: "task:v:vm", taskId: "v", mediaId: "vm", isVideo: true }));
+    images.push(img({ key: "artwork:a:b", source: "artwork" }));
+    await withFetch((call) => ({ body: { results: call.body.items.map((it) => ({ ...it, success: it.taskId !== "t7" })) } }),
+      async (calls) => {
+        const r = await A.setFavorite(images, true);
+        eq(calls.map((c) => [c.init.method, c.url.pathname, c.body.items.length, c.body.favorited]), [
+          ["PUT", "/v2/task/bookmarks/batch", 50, true], ["PUT", "/v2/task/bookmarks/batch", 50, true],
+          ["PUT", "/v2/task/bookmarks/batch", 20, true]]);
+        eq(calls[2].body.items[19], { taskId: "v" });
+        eq([r.ok.length, r.failed.sort()], [119, ["artwork:a:b", "task:t7:m7"]]);
+      });
+  });
+  test("deleteImages: published skipped, failed chunk, video, artwork", async () => {
+    const images = Array.from({ length: 60 }, (_, i) => img({ key: "task:t" + i + ":m" + i, taskId: "t" + i, mediaId: "m" + i }));
+    images.push(img({ key: "task:v1:vm", taskId: "v1", mediaId: "vm", isVideo: true }));
+    images.push(img({ key: "task:v2:vm2", taskId: "v2", mediaId: "vm2", isVideo: true }));
+    // Forged or stale: flagged as a video, but on the server this media is not the task's video.
+    images.push(img({ key: "task:v3:m9", taskId: "v3", mediaId: "m9", isVideo: true }));
+    images.push(img({ key: "artwork:a:b", source: "artwork" }));
+    let batch = 0;
+    await withFetch((call) => {
+      if (call.url.pathname === "/v2/task/media/batch-delete") {
+        batch++;
+        if (batch === 2) return { status: 500, body: {} };
+        return { body: { results: call.body.items.map((it) => it.mediaId === "m3"
+          ? { ...it, success: false, reason: "MEDIA_PUBLISHED" } : { ...it, success: true }), deletedTaskIds: ["t0"] } };
+      }
+      if (call.url.pathname === "/v2/task/v1") return { body: { status: "completed", outputs: { videoMediaId: "vm" }, artworkCount: 0 } };
+      if (call.url.pathname === "/v2/task/v2") return { body: { status: "completed", outputs: { videoMediaId: "vm2" }, isPublished: true } };
+      if (call.url.pathname === "/v2/task/v3") return { body: { status: "completed", outputs: { mediaIds: ["m9", "m10"] }, artworkCount: 0 } };
+      if (call.url.pathname === "/v2/task/v1/delete") return { body: {} };
+      return { status: 404, body: {} };
+    }, async (calls) => {
+      const progress = [];
+      const r = await A.deleteImages(images, { onProgress: (p) => progress.push(p.done) });
+      eq(calls.map((c) => c.url.pathname), ["/v2/task/media/batch-delete", "/v2/task/media/batch-delete",
+        "/v2/task/v1", "/v2/task/v1/delete", "/v2/task/v2", "/v2/task/v3"]);
+      eq(calls[0].body.items.length, 50);
+      eq(calls[0].body.items[0], { taskId: "t0", mediaId: "m0" });
+      eq([r.deleted.length, r.skippedPublished.sort(), r.failed.length], [50, ["task:t3:m3", "task:v2:vm2"], 12]);
+      eq(r.failed.find((f) => f.key === "task:v3:m9").reason, "NOT_A_VIDEO_TASK");
+      eq(r.failed.find((f) => f.key === "task:t55:m55").reason, "HTTP_500");
+      eq(r.failed.find((f) => f.key === "artwork:a:b").reason, "NOT_TASK_IMAGE");
+      eq(r.deletedTaskIds.sort(), ["t0", "v1"]);
+      eq(progress, [50, 60, 61, 62, 63]);
+    });
+  });
+  test("names Chrome would refuse are cleaned or rejected", () => {
+    eq(PGM.naming.sanitize("smile~ Fav~"), "smile- Fav");
+    eq(PGM.naming.sanitize("a​b⁠c﻿d￾e"), "a-b-c-d-e");
+    eq(PGM.queue.isSafePath("PixAI/.hidden/x.png"), false);
+    eq(PGM.queue.isSafePath("PixAI/a.lnk/x.png"), false);
+    eq(PGM.queue.isSafePath("PixAI/a~b/x.png"), false);
+    eq(PGM.queue.isSafePath("PixAI/风景/风景_1.png"), true);
+  });
+  test("folder import rebuilds keys and checks video items", async () => {
+    const good = { key: "task:11:22", source: "task", taskId: "11", mediaId: "22", url: "https://images-ng.pixai.art/images/orig/u", ext: "png" };
+    const json = JSON.stringify({ version: 1, folders: [{ name: "导入测试", items: [
+      good,
+      { ...good, key: "task:11:99" },
+      { ...good, key: "task:11:23", mediaId: "23", isVideo: true, ext: "png" }
+    ] }] });
+    await PGM.folders.importText(json);
+    const folder = (await PGM.folders.list()).find((f) => f.name === "导入测试");
+    eq(folder.items.map((i) => i.key), ["task:11:22"]);
+  });
+  test("deleteImages stops on LOGIN_REQUIRED and on abort", async () => {
+    const images = Array.from({ length: 120 }, (_, i) => img({ key: "k" + i, taskId: "t" + i, mediaId: "m" + i }));
+    await withFetch(() => ({ status: 401, body: {} }), async (calls) => {
+      const r = await A.deleteImages(images);
+      eq([calls.length, r.failed.length, r.failed[119].reason], [1, 120, "LOGIN_REQUIRED"]);
+    });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await withFetch(() => ({ body: { results: [] } }), async (calls) => {
+      const r = await A.deleteImages(images, { signal: ctrl.signal });
+      eq([calls.length, r.failed[0].reason], [0, "CANCELLED"]);
+    });
+  });
+  test("collections: list paging, items, generationInfo", async () => {
+    const coll = (id, title) => ({ id, title, itemCount: 3, reservedType: title ? null : "default" });
+    await withFetch((call) => {
+      const p = call.url.pathname;
+      if (p === "/v2/collection/list/99") {
+        return call.url.searchParams.get("cursor")
+          ? { body: { data: [coll("b", "风景")], nextCursor: null } }
+          : { body: { data: [coll("a", "")], nextCursor: "n1" } };
+      }
+      if (p === "/v2/collection/a/items") return { body: { data: [
+        { refType: "artwork", effectiveStatus: "available", artwork: { id: "30", mediaId: "40", prompts: "p", createdAt: "2026-10-01T00:00:00.000Z",
+          videoMediaId: "41", media: { publicUrl: "https://images-ng.pixai.art/images/orig/u" } } },
+        { refType: "artwork", effectiveStatus: "unavailable", artwork: null }], nextCursor: null } };
+      if (p === "/v2/media/batch") return { body: [{ id: "41", type: "VIDEO", urls: [{ variant: "PUBLIC", url: "https://images-ng.pixai.art/v/orig/x" }] }] };
+      if (p === "/v2/artwork/30/task-parameters") return { body: { id: "77", createdAt: "2026-09-30T00:00:00.000Z", parameters: { prompts: "gp" } } };
+      if (p === "/v2/artwork/31/task-parameters") return { status: 404, body: { code: "NOT_FOUND" } };
+      return { status: 500, body: {} };
+    }, async (calls) => {
+      const lang = PGM.i18n.lang;
+      PGM.i18n.lang = "zh";
+      const list = await A.listArtworkCollections("99");
+      PGM.i18n.lang = lang;
+      eq(list, [{ id: "a", title: "我的收藏", itemCount: 3, reserved: true }, { id: "b", title: "风景", itemCount: 3, reserved: false }]);
+      const q = calls[0].url.searchParams;
+      eq([q.get("contentType"), q.get("sort"), q.get("limit")], ["artwork", "recent", "50"]);
+      const items = await A.listCollectionItems("a", null);
+      eq([items.images.length, items.skipped, items.nextCursor], [1, 1, null]);
+      eq([items.images[0].isVideo, items.images[0].ext, items.images[0].url, items.images[0].key],
+        [true, "mp4", "https://images-ng.pixai.art/v/orig/x", "artwork:30:40"]);
+      ok(!("_videoMediaId" in items.images[0]), "internal field removed");
+      const itemQuery = calls.find((c) => c.url.pathname === "/v2/collection/a/items").url.searchParams;
+      eq([itemQuery.get("limit"), itemQuery.get("sort")], ["24", "newest"]);
+      eq(await A.generationInfo("30"), { createdAt: "2026-09-30T00:00:00.000Z", prompt: "gp", taskId: "77" });
+      eq(await A.generationInfo("31"), null);
+      const before = calls.length;
+      await A.generationInfo("30");
+      eq(calls.length, before, "cached");
+    });
+  });
+
+  // ---- folders ---------------------------------------------------------------
+
+  test("folders: names, add, dedupe, rename, remove keys", async () => {
+    const f = await F.create("风景");
+    await rejects(F.create(" 风景 "), "FOLDER_NAME_TAKEN");
+    await rejects(F.create(""), "FOLDER_NAME_EMPTY");
+    await rejects(F.create("x".repeat(61)), "FOLDER_NAME_TOO_LONG");
+    await F.create("Landscape");
+    await rejects(F.create("landscape"), "FOLDER_NAME_TAKEN");
+    eq(await F.validateName("LANDSCAPE"), "FOLDER_NAME_TAKEN");
+    eq(await F.validateName("风景", f.id), null);
+
+    const good = img({ key: "task:111:222", favorited: true, extra: "dropped" });
+    const evil = img({ key: "task:1:2", url: "https://evil.com/x.png" });
+    eq(await F.addItems(f.id, [good, good, evil]), { added: 1, skipped: 2 });
+    const images = await F.getImages(f.id);
+    eq(images.length, 1);
+    eq([images[0].favorited, images[0].key, "extra" in images[0], typeof images[0].addedAt], [false, "task:111:222", false, "string"]);
+
+    await rejects(F.rename(f.id, "landscape"), "FOLDER_NAME_TAKEN");
+    eq((await F.rename(f.id, "风景2")).name, "风景2");
+    eq(await F.removeKeys(["task:111:222", "nope"]), { removed: 1 });
+    eq(await F.addItems(f.id, [good]), { added: 1, skipped: 0 });
+    eq(await F.removeItems(f.id, ["task:111:222"]), { removed: 1 });
+    await rejects(F.addItems("missing", [good]), "FOLDER_NOT_FOUND");
+  });
+  test("folders: export and import merge with validation", async () => {
+    const all = await F.list();
+    const target = all.find((x) => x.name === "风景2");
+    await F.addItems(target.id, [img({ key: "task:5:6", taskId: "5", mediaId: "6" })]);
+    const exported = await F.exportData();
+    eq(exported.version, 1);
+    const again = await F.importData(JSON.parse(JSON.stringify(exported)));
+    eq([again.created, again.merged, again.items, again.skipped], [0, exported.folders.length, 0, 0]);
+
+    const r = await F.importData({ version: 1, folders: [
+      { name: "新收藏", items: [img({ key: "task:8:9", taskId: "8", mediaId: "9" }), img({ key: "task:8:10", url: "https://evil.com/a.png" }), { key: "x" }] },
+      { name: "风景2", items: [img({ key: "task:5:7", taskId: "5", mediaId: "7" })] },
+      { name: "", items: [] },
+      { name: "bad items", items: "nope" }
+    ] });
+    eq([r.created, r.merged, r.items, r.skipped], [1, 1, 2, 4]);
+    eq((await F.list()).find((x) => x.name === "风景2").items.length, 2);
+    await rejects(F.importData({ version: 2, folders: [] }), "IMPORT_INVALID");
+    await rejects(F.importText("{bad"), "IMPORT_PARSE");
+    const removed = await F.remove(target.id);
+    eq(removed, { name: "风景2", count: 2 });
+  });
+
+  // ---- language -------------------------------------------------------------
+
+  test("i18n.use: auto / zh / en, reports changes", () => {
+    const before = PGM.i18n.lang;
+    try {
+      PGM.i18n.lang = "zh";
+      eq(PGM.i18n.use("zh"), false);
+      eq(PGM.i18n.use("en"), true);
+      eq(PGM.i18n.lang, "en");
+      eq(PGM.t("view.all"), "All generations");
+      PGM.i18n.use("auto");
+      eq(PGM.i18n.lang, PGM.i18n.auto);
+      PGM.i18n.use("xx");
+      eq(PGM.i18n.lang, PGM.i18n.auto, "unknown values mean auto");
+    } finally {
+      PGM.i18n.lang = before;
+    }
+  });
+
+  test("every zh string has an en string", () => {
+    const zh = Object.keys(PGM.i18n.strings.zh);
+    const missing = zh.filter((k) => !Object.prototype.hasOwnProperty.call(PGM.i18n.strings.en, k));
+    eq(missing, []);
+  });
+
+  test("naming: the no-folder sub-folder follows the language unless set", () => {
+    const before = PGM.i18n.lang;
+    try {
+      PGM.i18n.lang = "en";
+      eq(N.buildPath(img(), { settings: { template: "{time}" } }), "PixAI/Generations/20261103-140509.png");
+      PGM.i18n.lang = "zh";
+      eq(N.buildPath(img(), { settings: { template: "{time}" } }), "PixAI/生成记录/20261103-140509.png");
+      eq(N.buildPath(img(), { settings: { template: "{time}", noFolderName: "Mine" } }), "PixAI/Mine/20261103-140509.png");
+      eq(N.buildDirectory({ directory: "PixAI/{folder}" }, "风景"), "PixAI/风景");
+    } finally {
+      PGM.i18n.lang = before;
+    }
+  });
+
+  test("settings: language, download mode, zip size; old fixed folder name becomes the default", () => {
+    const n = PGM.settings.normalize({ language: "en", downloadMode: "files", zipPartMB: 2000, noFolderName: "生成记录" });
+    eq([n.language, n.downloadMode, n.zipPartMB, n.noFolderName], ["en", "files", 2000, ""]);
+    const d = PGM.settings.normalize({ language: "fr", downloadMode: "rar", zipPartMB: 3 });
+    eq([d.language, d.downloadMode, d.zipPartMB], ["auto", "zip", 1000]);
+  });
+
+  test("t.reason: known codes, HTTP status, Chrome errors, unknown", () => {
+    const before = PGM.i18n.lang;
+    try {
+      PGM.i18n.lang = "zh";
+      eq(PGM.t.reason("HTTP_404"), "请求失败（HTTP 404）");
+      eq(PGM.t.reason("FILE_NO_SPACE"), "磁盘空间不足");
+      eq(PGM.t.reason("WEIRD_CODE"), "WEIRD_CODE");
+      eq(PGM.t.reason(""), "未知错误");
+      PGM.i18n.lang = "en";
+      eq(PGM.t.reason("NETWORK_FAILED"), "Network error");
+    } finally {
+      PGM.i18n.lang = before;
+    }
+  });
+
+  // ---- zip ------------------------------------------------------------------
+
+  const Z = PGM.zip;
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+
+  // Reads an archive the way unzip tools do: from the end record through the central directory.
+  async function readZip(blob) {
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    const v = new DataView(buf.buffer);
+    const end = buf.length - 22;
+    eq(v.getUint32(end, true), 0x06054b50, "end record");
+    const count = v.getUint16(end + 10, true);
+    const cdSize = v.getUint32(end + 12, true);
+    const cdOff = v.getUint32(end + 16, true);
+    eq(cdOff + cdSize, end, "directory ends at the end record");
+    const files = [];
+    let p = cdOff;
+    for (let i = 0; i < count; i++) {
+      eq(v.getUint32(p, true), 0x02014b50, "central header");
+      const flags = v.getUint16(p + 8, true);
+      const method = v.getUint16(p + 10, true);
+      const time = v.getUint16(p + 12, true);
+      const date = v.getUint16(p + 14, true);
+      const crc = v.getUint32(p + 16, true);
+      const size = v.getUint32(p + 20, true);
+      eq(v.getUint32(p + 24, true), size, "stored: sizes equal");
+      const nlen = v.getUint16(p + 28, true);
+      const elen = v.getUint16(p + 30, true);
+      const clen = v.getUint16(p + 32, true);
+      const off = v.getUint32(p + 42, true);
+      const name = dec.decode(buf.subarray(p + 46, p + 46 + nlen));
+      eq(v.getUint32(off, true), 0x04034b50, "local header of " + name);
+      eq(v.getUint32(off + 14, true), crc, "local crc of " + name);
+      const lnlen = v.getUint16(off + 26, true);
+      const lelen = v.getUint16(off + 28, true);
+      eq(dec.decode(buf.subarray(off + 30, off + 30 + lnlen)), name, "local name");
+      const start = off + 30 + lnlen + lelen;
+      const data = buf.subarray(start, start + size);
+      eq(Z.crc32(data), crc, "crc of " + name);
+      files.push({ name, flags, method, time, date, data, text: dec.decode(data) });
+      p += 46 + nlen + elen + clen;
+    }
+    eq(p, end, "directory walked to the end");
+    return files;
+  }
+
+  test("zip: crc32 known values", () => {
+    eq(Z.crc32(enc.encode("123456789")), 0xcbf43926);
+    eq(Z.crc32(new Uint8Array(0)), 0);
+    eq(Z.crc32(enc.encode("6789"), Z.crc32(enc.encode("12345"))), 0xcbf43926, "incremental");
+  });
+
+  test("zip: archive structure, UTF-8 names, DOS time", async () => {
+    const w = Z.createWriter();
+    w.add("a.txt", enc.encode("hello"), new Date(2026, 10, 3, 14, 5, 9));
+    w.add("风景_20261103-140509_1girl.png", new Uint8Array([137, 80, 78, 71, 1, 2, 3]), new Date(1970, 0, 1));
+    eq(w.count, 2);
+    const projected = w.projected(5, 10);
+    const blob = w.finish();
+    eq(blob.type, "application/zip");
+    eq(projected, blob.size + 30 + 5 + 10 + 46 + 5, "projected size");
+    const files = await readZip(blob);
+    eq(files.map((f) => f.name), ["a.txt", "风景_20261103-140509_1girl.png"]);
+    eq(files.map((f) => [f.flags, f.method]), [[0x0800, 0], [0x0800, 0]]);
+    eq(files[0].text, "hello");
+    eq([files[0].date >> 9, (files[0].date >> 5) & 15, files[0].date & 31], [46, 11, 3], "2026-11-03");
+    eq([files[0].time >> 11, (files[0].time >> 5) & 63, (files[0].time & 31) * 2], [14, 5, 8], "14:05:08 (2 s steps)");
+    eq(files[1].date, (1 << 5) | 1, "before 1980 clamps to 1980-01-01");
+    let threw = false;
+    try {
+      w.add("late.txt", enc.encode("x"));
+    } catch (e) {
+      threw = e.code === "ZIP_FINISHED";
+    }
+    ok(threw, "a finished writer refuses more files");
+  });
+
+  test("zip: safeName and uniqueName", () => {
+    eq(Z.safeName("../a/b\\c:d.png"), "a-b-c-d.png");
+    eq(Z.safeName("  .hidden"), "hidden");
+    eq(Z.safeName(""), "file");
+    eq(Z.safeName("x".repeat(300) + ".png").length, 200);
+    ok(Z.safeName("x".repeat(300) + ".png").endsWith(".png"));
+    const taken = new Set();
+    eq([Z.uniqueName("a.png", taken), Z.uniqueName("A.png", taken), Z.uniqueName("a.png", taken), Z.uniqueName("noext", taken), Z.uniqueName("noext", taken)],
+      ["a.png", "A (1).png", "a (2).png", "noext", "noext (1)"]);
+  });
+
+  // ---- packer ---------------------------------------------------------------
+
+  const zipEntry = (i, extra) => Object.assign({ index: i, url: "https://images-ng.pixai.art/x/" + i, name: "img_" + i + ".png", time: Date.parse(T) }, extra);
+  const codeErr = (code) => Object.assign(new Error(code), { code });
+
+  async function pack(job, opts) {
+    const o = opts || {};
+    const saves = [];
+    const events = [];
+    const calls = {};
+    const result = await PGM.packer.run(Object.assign({ label: "下载：测试", baseName: "PixAI_测试_20261103-140509", concurrency: 1, partBytes: 1e9 }, job), {
+      signal: o.signal,
+      sleep: async () => {},
+      now: () => new Date(2026, 10, 3, 14, 5, 9),
+      fetchFile: async (url, signal) => {
+        calls[url] = (calls[url] || 0) + 1;
+        return o.fetch(url, calls[url], signal);
+      },
+      save: async (blob, name) => {
+        if (o.save) await o.save(blob, name);
+        saves.push({ blob, name });
+        return 100 + saves.length;
+      },
+      onEvent: (e) => events.push(e)
+    });
+    return { result, saves, events, calls };
+  }
+
+  test("packer: one archive with a report; retries only what is worth retrying", async () => {
+    const entries = [zipEntry(0), zipEntry(1), zipEntry(2), zipEntry(3), zipEntry(4, { name: "img_0.png" })];
+    const { result, saves, events, calls } = await pack({
+      lang: "zh", entries,
+      preFailed: [{ index: 5, name: "bad.png", url: "http://evil.example/x", error: "BAD_URL" }]
+    }, {
+      fetch: (url, n) => {
+        if (url.endsWith("/1") && n < 3) throw codeErr("HTTP_503"); // third try works
+        if (url.endsWith("/2")) throw codeErr("HTTP_404"); // never retried
+        if (url.endsWith("/3")) throw codeErr("FETCH_FAILED"); // gives up after 3 tries
+        return enc.encode("data of " + url);
+      }
+    });
+    const u = (i) => "https://images-ng.pixai.art/x/" + i;
+    eq([calls[u(0)], calls[u(1)], calls[u(2)], calls[u(3)]], [1, 3, 1, 3], "attempts per file");
+    eq(saves.map((s) => s.name), ["PixAI_测试_20261103-140509.zip"]);
+    eq(result.done, 3);
+    eq(result.total, 6);
+    eq(result.failed.map((f) => [f.index, f.error]).sort(), [[2, "HTTP_404"], [3, "FETCH_FAILED"], [5, "BAD_URL"]]);
+    eq(result.zips, [{ name: "PixAI_测试_20261103-140509.zip", id: 101, count: 3 }]);
+    const files = await readZip(saves[0].blob);
+    eq(files.map((f) => f.name), ["img_0.png", "img_1.png", "img_0 (1).png", "_下载报告.txt"]);
+    eq(files[1].text, "data of " + u(1));
+    const report = files[3].text;
+    eq([...files[3].data.subarray(0, 3)], [0xef, 0xbb, 0xbf], "UTF-8 BOM"); // TextDecoder drops it from .text
+    ok(report.startsWith("PixAI 图库管理 · 下载报告\r\n"), "title, CRLF");
+    ok(report.includes("任务：下载：测试"), report);
+    ok(report.includes("压缩包：PixAI_测试_20261103-140509.zip"), report);
+    ok(report.includes("本压缩包：成功 3 个，失败 3 个"), report);
+    ok(report.includes("整个任务：共 6 个，成功 3 个，失败 3 个，共 1 个压缩包"), report);
+    ok(report.includes("  img_2.png\r\n    原因：请求失败（HTTP 404）\r\n    链接：" + u(2)), report);
+    ok(report.includes("原因：图片链接不在允许的域名内"), report);
+    ok(report.includes("成功（3）：\r\n  img_0.png\r\n  img_1.png\r\n  img_0 (1).png"), report);
+    ok(report.includes("重试失败项"), "retry hint");
+    const part = events.find((e) => e.type === "part");
+    eq([part.ok, part.id, part.indices], [true, 101, [0, 1, 4]]);
+    eq(events.filter((e) => e.type === "progress").length, 5);
+  });
+
+  test("packer: splits into parts by size, each with its own report", async () => {
+    const entries = [0, 1, 2, 3, 4, 5].map((i) => zipEntry(i));
+    const { result, saves } = await pack({ lang: "zh", entries, partBytes: 20 * 1024 }, {
+      fetch: () => new Uint8Array(6 * 1024).fill(7)
+    });
+    eq(saves.map((s) => s.name), ["PixAI_测试_20261103-140509_part1.zip", "PixAI_测试_20261103-140509_part2.zip", "PixAI_测试_20261103-140509_part3.zip"]);
+    eq(result.done, 6);
+    const names = [];
+    for (const s of saves) {
+      ok(s.blob.size <= 20 * 1024, "part within the limit: " + s.blob.size);
+      const files = await readZip(s.blob);
+      eq(files[files.length - 1].name, "_下载报告.txt");
+      names.push(...files.slice(0, -1).map((f) => f.name));
+    }
+    eq(names, entries.map((e) => e.name));
+    const last = (await readZip(saves[2].blob)).pop().text;
+    ok(last.includes("整个任务：共 6 个，成功 6 个，失败 0 个，共 3 个压缩包"), last);
+    const first = (await readZip(saves[0].blob)).pop().text;
+    ok(!first.includes("整个任务"), "only the last part has the job total");
+  });
+
+  test("packer: cancel stops fetching and saves what was packed", async () => {
+    const ctrl = new AbortController();
+    const entries = [0, 1, 2, 3].map((i) => zipEntry(i));
+    const { result, saves, calls } = await pack({ lang: "zh", entries }, {
+      signal: ctrl.signal,
+      fetch: (url) => {
+        if (url.endsWith("/2")) {
+          ctrl.abort();
+          throw codeErr("CANCELLED");
+        }
+        return enc.encode(url);
+      }
+    });
+    eq(result.cancelled, true);
+    eq(result.done, 2);
+    eq(result.failed, [], "not attempted is not failed");
+    eq(calls["https://images-ng.pixai.art/x/3"], undefined, "nothing fetched after cancel");
+    const files = await readZip(saves[0].blob);
+    eq(files.map((f) => f.name), ["img_0.png", "img_1.png", "_下载报告.txt"]);
+    ok(files[2].text.includes("任务已取消"), files[2].text);
+  });
+
+  test("packer: an archive that cannot be saved fails its files", async () => {
+    const entries = [0, 1].map((i) => zipEntry(i));
+    const { result, events } = await pack({ lang: "zh", entries }, {
+      fetch: (url) => enc.encode(url),
+      save: () => {
+        throw codeErr("FILE_NO_SPACE");
+      }
+    });
+    eq(result.done, 0);
+    eq(result.zips, []);
+    eq(result.failed.map((f) => [f.index, f.error]), [[0, "FILE_NO_SPACE"], [1, "FILE_NO_SPACE"]]);
+    const part = events.find((e) => e.type === "part");
+    eq([part.ok, part.error, part.indices], [false, "FILE_NO_SPACE", [0, 1]]);
+  });
+
+  test("packer: English report; nothing fetched means a report-only archive", async () => {
+    const { result, saves } = await pack({ lang: "en", label: "Download: test", entries: [zipEntry(0)] }, {
+      fetch: () => {
+        throw codeErr("HTTP_403");
+      }
+    });
+    eq(result.done, 0);
+    eq(saves.length, 1);
+    const files = await readZip(saves[0].blob);
+    eq(files.map((f) => f.name), ["_download-report.txt"]);
+    ok(files[0].text.includes("Failed (1):\r\n  img_0.png\r\n    Reason: Request failed (HTTP 403)"), files[0].text);
+    ok(files[0].text.includes("Saved (0):\r\n  (none)"), files[0].text);
+    eq(PGM.i18n.lang, "zh", "the page language is restored");
+  });
+
+  test("packer: concurrency 3 keeps every file and the order of names per part", async () => {
+    const entries = Array.from({ length: 12 }, (_, i) => zipEntry(i));
+    const { result, saves } = await pack({ lang: "zh", entries, concurrency: 3 }, {
+      fetch: async (url) => {
+        await sleep(Math.random() * 15);
+        return enc.encode(url);
+      }
+    });
+    eq(result.done, 12);
+    const files = await readZip(saves[0].blob);
+    eq(files.length, 13);
+    eq(files.slice(0, -1).map((f) => f.name).sort(), entries.map((e) => e.name).sort());
+  });
+
+  // ---- WebP -> PNG ------------------------------------------------------------
+
+  const C = PGM.convert;
+  // RIFF/WEBP container with the given chunks ([tag, payloadBytes]); payloads are not real image data.
+  function riff(chunks) {
+    const parts = [];
+    for (const [tag, payload] of chunks) {
+      const body = new Uint8Array(payload);
+      const head = new Uint8Array(8);
+      head.set([...tag].map((c) => c.charCodeAt(0)), 0);
+      new DataView(head.buffer).setUint32(4, body.length, true);
+      parts.push(head, body, body.length & 1 ? new Uint8Array(1) : new Uint8Array(0));
+    }
+    const size = parts.reduce((n, x) => n + x.length, 4);
+    const out = new Uint8Array(8 + size);
+    out.set(enc.encode("RIFF"), 0);
+    new DataView(out.buffer).setUint32(4, size, true);
+    out.set(enc.encode("WEBP"), 8);
+    let pos = 12;
+    for (const x of parts) {
+      out.set(x, pos);
+      pos += x.length;
+    }
+    return out;
+  }
+
+  test("convert: webpInfo reads lossless, lossy and animated containers", () => {
+    eq(C.webpInfo(riff([["VP8L", [1, 2, 3, 4, 5]]])), { webp: true, animated: false, lossless: true });
+    eq(C.webpInfo(riff([["VP8 ", [1, 2, 3, 4]]])), { webp: true, animated: false, lossless: false });
+    eq(C.webpInfo(riff([["VP8X", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0]], ["ANIM", [0, 0, 0, 0, 0, 0]]])).animated, true);
+    eq(C.webpInfo(riff([["VP8X", [0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]], ["ALPH", [1]], ["VP8 ", [1, 2]]])),
+      { webp: true, animated: false, lossless: false }, "VP8X with alpha only is still");
+    eq(C.webpInfo(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0, 0, 0, 0, 0, 0, 0])).webp, false);
+    eq(C.webpInfo(new Uint8Array(3)).webp, false);
+  });
+
+  test("convert: pngName", () => {
+    eq([C.pngName("a.webp"), C.pngName("风景_1.WEBP"), C.pngName("noext"), C.pngName("a.b.webp")], ["a.png", "风景_1.png", "noext.png", "a.b.png"]);
+  });
+
+  // Decoded RGBA of an encoded image, through the browser's own decoder.
+  async function pixels(bytes, type) {
+    const bmp = await createImageBitmap(new Blob([bytes], { type }), { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+    const c = new OffscreenCanvas(bmp.width, bmp.height);
+    const ctx = c.getContext("2d");
+    ctx.drawImage(bmp, 0, 0);
+    return { w: bmp.width, h: bmp.height, data: ctx.getImageData(0, 0, bmp.width, bmp.height).data };
+  }
+
+  test("convert: toPng keeps every decoded pixel of a WebP", async () => {
+    const c = new OffscreenCanvas(37, 23);
+    const ctx = c.getContext("2d");
+    for (let y = 0; y < 23; y++) for (let x = 0; x < 37; x++) {
+      ctx.fillStyle = `rgb(${(x * 7) % 256},${(y * 11) % 256},${(x * y) % 256})`;
+      ctx.fillRect(x, y, 1, 1);
+    }
+    const webp = new Uint8Array(await (await c.convertToBlob({ type: "image/webp", quality: 1 })).arrayBuffer());
+    ok(C.webpInfo(webp).webp, "the browser made a WebP");
+    const png = await C.toPng(webp);
+    eq([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], "PNG signature");
+    const a = await pixels(webp, "image/webp");
+    const b = await pixels(png, "image/png");
+    eq([b.w, b.h], [a.w, a.h]);
+    let diff = 0;
+    for (let i = 0; i < a.data.length; i++) if (a.data[i] !== b.data[i]) diff++;
+    eq(diff, 0, "differing channel values");
+    const r = await C.maybePng(webp, "x_1.webp");
+    eq([r.converted, r.name], [true, "x_1.png"]);
+  });
+
+  test("convert: animated WebP, other formats and broken data stay as they are", async () => {
+    const anim = riff([["VP8X", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0]], ["ANIM", [0, 0, 0, 0, 0, 0]]]);
+    eq((await C.maybePng(anim, "a.webp")).converted, false);
+    eq((await C.maybePng(anim, "a.webp")).name, "a.webp");
+    const notWebp = enc.encode("not an image at all");
+    eq((await C.maybePng(notWebp, "a.webp")).bytes, notWebp);
+    const broken = riff([["VP8L", [1, 2, 3, 4, 5]]]);
+    const r = await C.maybePng(broken, "b.webp");
+    eq([r.converted, r.name, r.bytes === broken], [false, "b.webp", true], "undecodable WebP is kept");
+  });
+
+  test("packer: converts entries marked toPng and says so in the report; a failed conversion keeps the original", async () => {
+    const entries = [zipEntry(0, { name: "a.webp", toPng: true }), zipEntry(1, { name: "b.webp", toPng: true }), zipEntry(2, { name: "c.webp" })];
+    const saves = [];
+    await PGM.packer.run({ label: "t", baseName: "PixAI_png", lang: "zh", concurrency: 1, partBytes: 1e9, entries }, {
+      sleep: async () => {},
+      fetchFile: async (url) => enc.encode("raw " + url),
+      transform: async (bytes, entry) => {
+        if (entry.name === "b.webp") throw new Error("decode failed");
+        return { bytes: enc.encode("PNG!"), name: entry.name.replace(".webp", ".png"), converted: true };
+      },
+      save: async (blob, name) => {
+        saves.push({ blob, name });
+        return 1;
+      }
+    });
+    const files = await readZip(saves[0].blob);
+    eq(files.map((f) => f.name), ["a.png", "b.webp", "c.webp", "_下载报告.txt"]);
+    eq([files[0].text, files[1].text], ["PNG!", "raw https://images-ng.pixai.art/x/1"]);
+    ok(files[3].text.includes("其中 1 个 WebP 已转成 PNG（画面不变）"), files[3].text);
+  });
+
+  test("settings: webpToPng defaults to on", () => {
+    eq(PGM.settings.normalize({}).webpToPng, true);
+    eq(PGM.settings.normalize({ webpToPng: false }).webpToPng, false);
+    eq(PGM.settings.normalize({ webpToPng: "no" }).webpToPng, true);
+  });
+
+  // ---- runner ----------------------------------------------------------------
+
+  async function run() {
+    const list = document.getElementById("list");
+    let pass = 0;
+    let fail = 0;
+    for (const t of tests) {
+      const li = document.createElement("li");
+      try {
+        await t.fn();
+        pass++;
+        li.className = "pass";
+        li.textContent = "PASS " + t.name;
+      } catch (e) {
+        fail++;
+        li.className = "fail";
+        li.textContent = "FAIL " + t.name;
+        const err = document.createElement("div");
+        err.className = "err";
+        err.textContent = String((e && e.stack) || e);
+        li.appendChild(err);
+        console.error("FAIL", t.name, e);
+      }
+      list.appendChild(li);
+    }
+    const result = document.getElementById("result");
+    result.textContent = "PASS " + pass + " / FAIL " + fail;
+    result.className = fail ? "fail" : "pass";
+  }
+
+  run();
+})();
+</script>
+</body>
+</html>
